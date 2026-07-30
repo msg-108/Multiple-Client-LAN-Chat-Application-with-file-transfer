@@ -3,14 +3,14 @@
 [Step 3] Server listening with backlog queue of 10
 
 =====================================================
-  Structured TCP Server with File Routing listening on port 8080...
-  Routing FILE_START, FILE_CHUNK & FILE_END packets verbatim
+  Robust Structured TCP Server on port 8080...
+  Features: Fault Isolation, Size Check, Mid-Transfer Cleanup
 =====================================================
 
-[Main Thread] Accepted connection from 127.0.0.1:41918 (FD: 4). Spawning worker thread...
-[Worker Thread 124124632446656] [+] Client 'Bob' registered: 127.0.0.1:41918 (FD: 4) [Connected: 1/100]
+[Main Thread] Accepted connection from 127.0.0.1:59876 (FD: 4). Spawning worker thread...
+[Worker Thread 127025547310784] [+] Client 'Bob' registered: 127.0.0.1:59876 (FD: 4) [Connected: 1/100]
 [BROADCAST EVENT] 'Bob' joined the chat.
-[-] Client 'Bob' (127.0.0.1:41918) disconnected cleanly or read error.
+[-] Client 'Bob' (127.0.0.1:59876) disconnected or read error.
 [BROADCAST EVENT] 'Bob' left the chat.
-[Worker Thread 124124632446656] Removed 'Bob' & closed FD 4. Remaining connected clients: 0/100.
+[Worker Thread 127025547310784] Removed 'Bob' & closed FD 4. Remaining connected clients: 0/100.
 
