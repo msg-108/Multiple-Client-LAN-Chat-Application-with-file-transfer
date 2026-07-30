@@ -20,6 +20,7 @@ static volatile int is_running = 1;
 // Global active file reception handle for receiver thread
 static FILE *active_recv_fp = NULL;
 static char active_recv_filename[MAX_FILENAME + 32] = {0};
+static char active_recv_sender[MAX_USERNAME] = {0};
 
 /**
  * Sends a structured message (Header + Payload) using send_all().
@@ -44,21 +45,8 @@ int send_packet(int sock_fd, int32_t type, const void *payload, int32_t payload_
 
 /**
  * Sends a file from client to target user using protocol.h structures and read_file_chunk().
- * 
- * Workflow:
- * 1. Open file in binary mode ("rb"); if it fails, print error and abort (do not send FILE_START).
- * 2. Send FILE_START with FileStartPayload (sender_username, target_username, filename) via send_all.
- * 3. Loop: read chunk with read_file_chunk(), send as FILE_CHUNK with Header.length set to ACTUAL bytes read.
- * 4. On EOF, send FILE_END with Header.length = 0 via send_all.
- * 
- * @param sock_fd Socket file descriptor.
- * @param sender_name Username of sender.
- * @param target_name Username of destination target user.
- * @param filepath Local path to file.
- * @return 0 on success, -1 on failure.
  */
 int send_file_to_user(int sock_fd, const char *sender_name, const char *target_name, const char *filepath) {
-    // Step 1: Open file in binary mode ("rb"). If it fails, print error and abort
     FILE *fp = fopen(filepath, "rb");
     if (!fp) {
         perror("[CLIENT ERROR] Failed to open file for reading");
@@ -66,12 +54,10 @@ int send_file_to_user(int sock_fd, const char *sender_name, const char *target_n
         return -1;
     }
 
-    // Extract basename from filepath
     const char *basename = strrchr(filepath, '/');
     if (!basename) basename = strrchr(filepath, '\\');
     basename = (basename) ? (basename + 1) : filepath;
 
-    // Step 2: Send FILE_START with FileStartPayload via send_all
     FileStartPayload meta;
     memset(&meta, 0, sizeof(meta));
     strncpy(meta.sender_username, sender_name, MAX_USERNAME - 1);
@@ -87,14 +73,12 @@ int send_file_to_user(int sock_fd, const char *sender_name, const char *target_n
         return -1;
     }
 
-    // Step 3: Loop reading chunks with read_file_chunk(), sending FILE_CHUNK with Header.length set to ACTUAL bytes read
     char chunk_buffer[CHUNK_SIZE];
     int bytes_read = 0;
     int total_bytes_sent = 0;
 
     while ((bytes_read = read_file_chunk(fp, chunk_buffer, CHUNK_SIZE)) > 0) {
         Header chunk_header = { .type = FILE_CHUNK, .length = bytes_read };
-        // Use send_all for Header and Payload
         if (send_all(sock_fd, &chunk_header, (int)sizeof(Header)) < 0 ||
             send_all(sock_fd, chunk_buffer, bytes_read) < 0) {
             perror("[CLIENT ERROR] Error sending FILE_CHUNK packet");
@@ -104,9 +88,8 @@ int send_file_to_user(int sock_fd, const char *sender_name, const char *target_n
         total_bytes_sent += bytes_read;
     }
 
-    fclose(fp); // Close file handle on EOF
+    fclose(fp);
 
-    // Step 4: On EOF, send FILE_END with Header.length = 0 via send_all
     Header end_header = { .type = FILE_END, .length = 0 };
     if (send_all(sock_fd, &end_header, (int)sizeof(Header)) < 0) {
         perror("[CLIENT ERROR] Failed to send FILE_END packet");
@@ -121,14 +104,14 @@ int send_file_to_user(int sock_fd, const char *sender_name, const char *target_n
 /**
  * Receiver Worker Thread Routine
  * 
- * Handles incoming chat, user status, and routed binary file transfers.
+ * Handles incoming chat, user status, and binary file reception using write_file_chunk().
  */
 void *receive_handler_thread(void *arg) {
     int sock_fd = (int)(intptr_t)arg;
     Header header;
 
     while (is_running) {
-        // Read Header using recv_all()
+        // Read Header (8 bytes) using recv_all()
         int h_res = recv_all(sock_fd, &header, (int)sizeof(Header));
         if (h_res < 0) {
             if (is_running) {
@@ -178,23 +161,33 @@ void *receive_handler_thread(void *arg) {
             case FILE_START:
                 if (header.length >= (int32_t)sizeof(FileStartPayload) && payload != NULL) {
                     FileStartPayload *meta = (FileStartPayload *)payload;
-                    snprintf(active_recv_filename, sizeof(active_recv_filename), "received_%s", meta->filename);
+                    
+                    if (active_recv_fp != NULL) {
+                        fclose(active_recv_fp);
+                        active_recv_fp = NULL;
+                    }
 
-                    active_recv_fp = fopen(active_recv_filename, "wb"); // Binary write mode
+                    strncpy(active_recv_filename, meta->filename, sizeof(active_recv_filename) - 1);
+                    strncpy(active_recv_sender, meta->sender_username, sizeof(active_recv_sender) - 1);
+
+                    // Requirement: Print "Receiving <filename> from <sender_username>..."
+                    printf("Receiving %s from %s...\n", meta->filename, meta->sender_username);
+                    fflush(stdout);
+
+                    // Requirement: Open a new file for writing (binary mode "wb") using filename from payload
+                    active_recv_fp = fopen(meta->filename, "wb");
                     if (!active_recv_fp) {
-                        perror("[-] Failed to open output file for received file");
-                    } else {
-                        printf("\n[FILE] Incoming file transfer: '%s' from '%s'. Saving as '%s'...\n",
-                               meta->filename, meta->sender_username, active_recv_filename);
-                        fflush(stdout);
+                        perror("[CLIENT ERROR] Failed to open file for writing");
                     }
                 }
                 break;
 
             case FILE_CHUNK:
                 if (active_recv_fp != NULL && payload != NULL && header.length > 0) {
-                    // Write raw binary payload chunk to file using write_file_chunk()
-                    write_file_chunk(active_recv_fp, payload, header.length);
+                    // Requirement: Write exactly Header.length bytes to file using write_file_chunk()
+                    if (write_file_chunk(active_recv_fp, payload, header.length) != 0) {
+                        fprintf(stderr, "[CLIENT ERROR] Failed to write file chunk!\n");
+                    }
                 }
                 break;
 
@@ -202,7 +195,8 @@ void *receive_handler_thread(void *arg) {
                 if (active_recv_fp != NULL) {
                     fclose(active_recv_fp);
                     active_recv_fp = NULL;
-                    printf("[FILE] Transfer complete! Saved file as '%s'\n\n", active_recv_filename);
+                    // Requirement: Close file, print completion message
+                    printf("File transfer complete for '%s' from '%s'!\n", active_recv_filename, active_recv_sender);
                     fflush(stdout);
                 }
                 break;
@@ -216,9 +210,13 @@ void *receive_handler_thread(void *arg) {
         if (payload) free(payload);
     }
 
+    // Constraint: Handle interrupted transfer if connection drops mid-transfer
     if (active_recv_fp != NULL) {
         fclose(active_recv_fp);
         active_recv_fp = NULL;
+        printf("\n[CLIENT ERROR] File transfer of '%s' from '%s' was interrupted due to connection drop.\n",
+               active_recv_filename, active_recv_sender);
+        fflush(stdout);
     }
 
     return NULL;
