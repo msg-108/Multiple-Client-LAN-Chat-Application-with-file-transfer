@@ -12,29 +12,29 @@
 #define BACKLOG     10
 #define BUFFER_SIZE 1024
 
-/**
- * Structure representing a connected client entry in the global list
- */
 typedef struct {
     int socket_fd;
     char username[MAX_USERNAME];
     struct sockaddr_in client_addr;
 } client_entry_t;
 
-// Global connected clients list, current count, and protecting mutex
+typedef struct {
+    int client_fd;
+    struct sockaddr_in client_addr;
+} temp_client_info_t;
+
+typedef enum {
+    ADD_SUCCESS = 0,
+    ADD_ERR_FULL = -1,
+    ADD_ERR_DUPLICATE = -2
+} add_status_t;
+
 static client_entry_t *clients[MAX_CLIENTS] = { NULL };
 static int client_count = 0;
 static pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /**
- * Helper: Reads EXACTLY `len` bytes from socket file descriptor.
- * Naive recv() may return fewer bytes than requested; this loops until all `len` bytes
- * are received or until connection closes/errors.
- * 
- * @param fd Socket file descriptor.
- * @param buf Output buffer pointer.
- * @param len Exact number of bytes to receive.
- * @return Number of bytes read (len on success, 0 on EOF, -1 on error).
+ * Reads EXACTLY `len` bytes from socket.
  */
 ssize_t read_exact(int fd, void *buf, size_t len) {
     size_t total_read = 0;
@@ -45,24 +45,16 @@ ssize_t read_exact(int fd, void *buf, size_t len) {
         if (bytes_read > 0) {
             total_read += bytes_read;
         } else if (bytes_read == 0) {
-            // EOF: Client disconnected
             return (total_read == 0) ? 0 : -1;
         } else {
-            perror("read_exact error");
             return -1;
         }
     }
-
     return (ssize_t)total_read;
 }
 
 /**
- * Helper: Writes EXACTLY `len` bytes to socket file descriptor.
- * 
- * @param fd Socket file descriptor.
- * @param buf Input buffer pointer.
- * @param len Exact number of bytes to send.
- * @return Number of bytes written (len on success, -1 on error).
+ * Writes EXACTLY `len` bytes to socket.
  */
 ssize_t write_exact(int fd, const void *buf, size_t len) {
     size_t total_written = 0;
@@ -73,73 +65,94 @@ ssize_t write_exact(int fd, const void *buf, size_t len) {
         if (bytes_written > 0) {
             total_written += bytes_written;
         } else {
-            perror("write_exact error");
             return -1;
         }
     }
-
     return (ssize_t)total_written;
 }
 
 /**
- * Helper: Reads a complete Header struct (sizeof(Header) = 8 bytes) from socket.
- * 
- * @param fd Socket descriptor.
- * @param header Pointer to Header output struct.
- * @return 1 on success, 0 on client disconnect, -1 on error.
+ * Sends structured Header + Payload packet.
  */
-int read_header(int fd, Header *header) {
-    ssize_t res = read_exact(fd, header, sizeof(Header));
-    if (res == (ssize_t)sizeof(Header)) {
-        return 1;
-    } else if (res == 0) {
-        return 0; // Clean disconnect
-    } else {
-        return -1; // Read error
+int send_packet(int fd, int32_t type, const void *payload, int32_t payload_len) {
+    Header header = { .type = type, .length = payload_len };
+    if (write_exact(fd, &header, sizeof(Header)) < 0) return -1;
+    if (payload_len > 0 && payload != NULL) {
+        if (write_exact(fd, payload, (size_t)payload_len) < 0) return -1;
     }
+    return 0;
 }
 
 /**
- * Helper: Reads exactly payload_len bytes (Header.length) from socket.
- * 
- * @param fd Socket descriptor.
- * @param payload_buf Pointer to destination buffer.
- * @param payload_len Exact number of bytes to read.
- * @return 1 on success, -1 on error.
+ * Reads Header from socket.
  */
-int read_payload(int fd, void *payload_buf, size_t payload_len) {
-    if (payload_len == 0) {
-        return 1; // Empty payload (e.g. FILE_END)
-    }
-
-    ssize_t res = read_exact(fd, payload_buf, payload_len);
-    if (res == (ssize_t)payload_len) {
-        return 1;
-    }
+int read_header(int fd, Header *header) {
+    ssize_t res = read_exact(fd, header, sizeof(Header));
+    if (res == (ssize_t)sizeof(Header)) return 1;
+    if (res == 0) return 0;
     return -1;
 }
 
 /**
- * Adds a client to the global client list under mutex protection.
+ * Reads Payload from socket.
  */
-client_entry_t *add_client(int client_fd, struct sockaddr_in addr, const char *username) {
+int read_payload(int fd, void *payload_buf, size_t payload_len) {
+    if (payload_len == 0) return 1;
+    ssize_t res = read_exact(fd, payload_buf, payload_len);
+    return (res == (ssize_t)payload_len) ? 1 : -1;
+}
+
+/**
+ * Constraint: Duplicate check and client addition under the SAME mutex lock.
+ * 
+ * @param client_fd Client socket descriptor.
+ * @param addr Client address structure.
+ * @param raw_username Requested username string.
+ * @param out_entry Output created entry pointer.
+ * @return ADD_SUCCESS, ADD_ERR_FULL, or ADD_ERR_DUPLICATE.
+ */
+add_status_t add_client(int client_fd, struct sockaddr_in addr, const char *raw_username, client_entry_t **out_entry) {
     pthread_mutex_lock(&clients_mutex);
 
+    // 1. Check capacity limit
     if (client_count >= MAX_CLIENTS) {
         pthread_mutex_unlock(&clients_mutex);
-        return NULL;
+        return ADD_ERR_FULL;
     }
 
+    // Constraint: Limit username to MAX_USERNAME (32) chars
+    char clean_name[MAX_USERNAME];
+    strncpy(clean_name, raw_username, MAX_USERNAME - 1);
+    clean_name[MAX_USERNAME - 1] = '\0';
+
+    // Strip trailing line endings
+    size_t len = strlen(clean_name);
+    while (len > 0 && (clean_name[len - 1] == '\n' || clean_name[len - 1] == '\r')) {
+        clean_name[--len] = '\0';
+    }
+
+    if (len == 0) {
+        snprintf(clean_name, sizeof(clean_name), "Guest_%d", client_fd);
+    }
+
+    // 2. CRITICAL: Reject duplicates under the SAME lock!
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i] != NULL && strcmp(clients[i]->username, clean_name) == 0) {
+            pthread_mutex_unlock(&clients_mutex);
+            return ADD_ERR_DUPLICATE; // Duplicate name found
+        }
+    }
+
+    // 3. Add new client entry (lock held continuously)
     client_entry_t *entry = malloc(sizeof(client_entry_t));
     if (!entry) {
         pthread_mutex_unlock(&clients_mutex);
-        return NULL;
+        return ADD_ERR_FULL;
     }
 
     entry->socket_fd = client_fd;
     entry->client_addr = addr;
-    strncpy(entry->username, username, MAX_USERNAME - 1);
-    entry->username[MAX_USERNAME - 1] = '\0';
+    strcpy(entry->username, clean_name);
 
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i] == NULL) {
@@ -149,12 +162,13 @@ client_entry_t *add_client(int client_fd, struct sockaddr_in addr, const char *u
         }
     }
 
+    *out_entry = entry;
     pthread_mutex_unlock(&clients_mutex);
-    return entry;
+    return ADD_SUCCESS;
 }
 
 /**
- * Removes a client from the global client list by socket file descriptor.
+ * Removes a client from the global client list under mutex protection.
  */
 void remove_client(int client_fd) {
     pthread_mutex_lock(&clients_mutex);
@@ -172,7 +186,7 @@ void remove_client(int client_fd) {
 }
 
 /**
- * Returns current count of connected clients (thread-safe).
+ * Returns current count of connected clients.
  */
 int get_client_count(void) {
     pthread_mutex_lock(&clients_mutex);
@@ -182,13 +196,8 @@ int get_client_count(void) {
 }
 
 /**
- * Broadcasts a structured packet (Header + Payload) to all connected clients except sender.
- * 
- * Locks mutex ONLY to copy target socket descriptors, then releases mutex BEFORE write_exact().
- * 
- * @param sender_fd Socket descriptor of sending client.
- * @param header Structured Header to send.
- * @param payload Payload memory pointer.
+ * Broadcasts Header + Payload packet to all clients except sender.
+ * Locks mutex ONLY to snapshot target sockets.
  */
 void broadcast_packet(int sender_fd, Header header, const void *payload) {
     int target_sockets[MAX_CLIENTS];
@@ -202,33 +211,30 @@ void broadcast_packet(int sender_fd, Header header, const void *payload) {
     }
     pthread_mutex_unlock(&clients_mutex);
 
-    if (target_count == 0) {
-        return;
-    }
-
-    printf("[BROADCAST] Relaying Packet (Type: %d, Length: %d bytes) to %d recipient(s)...\n",
-           header.type, header.length, target_count);
+    if (target_count == 0) return;
 
     for (int i = 0; i < target_count; i++) {
         int dest_fd = target_sockets[i];
-
-        // Send Header (8 bytes)
         if (write_exact(dest_fd, &header, sizeof(Header)) < 0) {
-            printf("[BROADCAST ERROR] Failed to send Header to FD %d. Removing client.\n", dest_fd);
             remove_client(dest_fd);
             close(dest_fd);
             continue;
         }
-
-        // Send Payload if length > 0
         if (header.length > 0 && payload != NULL) {
             if (write_exact(dest_fd, payload, header.length) < 0) {
-                printf("[BROADCAST ERROR] Failed to send Payload to FD %d. Removing client.\n", dest_fd);
                 remove_client(dest_fd);
                 close(dest_fd);
             }
         }
     }
+}
+
+/**
+ * Requirement: Broadcast "[username] joined" / "[username] left" on connect/disconnect.
+ */
+void broadcast_user_event(int sender_fd, int32_t type, const char *username) {
+    Header header = { .type = type, .length = (int32_t)strlen(username) };
+    broadcast_packet(sender_fd, header, username);
 }
 
 /**
@@ -282,38 +288,90 @@ int start_listening(int server_fd, int backlog) {
 }
 
 /**
- * Worker Thread Handler for Each Connected Client
- * 
- * Requirement:
- * - Always receive Header first, then exactly Header.length bytes of payload
- * - Process messages using switch(header.type)
- * - Trust Header.length for payload memory allocation
+ * Worker Thread Handler for Connected Client
  */
 void *client_handler_thread(void *arg) {
     pthread_detach(pthread_self());
 
-    client_entry_t *entry = (client_entry_t *)arg;
-    if (!entry) {
-        return NULL;
-    }
-
-    int client_fd = entry->socket_fd;
-    struct sockaddr_in client_addr = entry->client_addr;
+    temp_client_info_t *temp_info = (temp_client_info_t *)arg;
+    int client_fd = temp_info->client_fd;
+    struct sockaddr_in client_addr = temp_info->client_addr;
+    free(temp_info);
 
     char client_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, sizeof(client_ip));
     int client_port = ntohs(client_addr.sin_port);
 
-    printf("[Worker Thread %lu] [+] Client '%s' connected: %s:%d (FD: %d) [Connected: %d/%d]\n",
+    // Requirement: First message received is the username (USER_JOIN or CHAT)
+    Header first_header;
+    int h_res = read_header(client_fd, &first_header);
+    if (h_res <= 0) {
+        printf("[-] Client %s:%d disconnected before registering username.\n", client_ip, client_port);
+        close(client_fd);
+        return NULL;
+    }
+
+    char raw_username[MAX_USERNAME] = {0};
+    if (first_header.length > 0) {
+        size_t read_len = (first_header.length < MAX_USERNAME - 1) ? first_header.length : (MAX_USERNAME - 1);
+        if (read_payload(client_fd, raw_username, read_len) < 0) {
+            printf("[-] Error reading username payload from %s:%d\n", client_ip, client_port);
+            close(client_fd);
+            return NULL;
+        }
+        raw_username[read_len] = '\0';
+
+        // Discard any remaining bytes if payload exceeded MAX_USERNAME
+        if (first_header.length > (int32_t)read_len) {
+            size_t remaining = first_header.length - read_len;
+            char *trash = malloc(remaining);
+            if (trash) {
+                read_exact(client_fd, trash, remaining);
+                free(trash);
+            }
+        }
+    } else {
+        snprintf(raw_username, sizeof(raw_username), "Guest_%d", client_fd);
+    }
+
+    // Constraint: Add client & check duplicate username under the SAME mutex lock
+    client_entry_t *entry = NULL;
+    add_status_t status = add_client(client_fd, client_addr, raw_username, &entry);
+
+    if (status == ADD_ERR_DUPLICATE) {
+        // Constraint: Send error message to client and close politely on duplicate
+        char err_msg[BUFFER_SIZE];
+        snprintf(err_msg, sizeof(err_msg), "ERROR: Username '%s' is already taken. Connection rejected.\n", raw_username);
+        send_packet(client_fd, CHAT, err_msg, (int32_t)strlen(err_msg));
+
+        printf("[REJECTED DUPLICATE] Client %s:%d rejected — Username '%s' already exists.\n",
+               client_ip, client_port, raw_username);
+        close(client_fd);
+        return NULL;
+    } else if (status == ADD_ERR_FULL) {
+        // Constraint: Send error message to client and close politely on capacity full
+        const char *err_msg = "ERROR: Server capacity full (100 clients). Connection rejected.\n";
+        send_packet(client_fd, CHAT, err_msg, (int32_t)strlen(err_msg));
+
+        printf("[REJECTED FULL] Client %s:%d rejected — Server full (%d/%d clients).\n",
+               client_ip, client_port, MAX_CLIENTS, MAX_CLIENTS);
+        close(client_fd);
+        return NULL;
+    }
+
+    printf("[Worker Thread %lu] [+] Client '%s' registered: %s:%d (FD: %d) [Connected: %d/%d]\n",
            (unsigned long)pthread_self(), entry->username, client_ip, client_port, client_fd,
            get_client_count(), MAX_CLIENTS);
 
+    // Requirement: Broadcast "[username] joined" on connect
+    printf("[BROADCAST EVENT] '%s' joined the chat.\n", entry->username);
+    broadcast_user_event(client_fd, USER_JOIN, entry->username);
+
     Header header;
 
-    // Loop: Receive Header first, then exact payload
+    // Receive loop for subsequent packets
     while (1) {
-        // Step A: Read Header
-        int h_res = read_header(client_fd, &header);
+        h_res = read_header(client_fd, &header);
         if (h_res <= 0) {
             if (h_res == 0) {
                 printf("[-] Client '%s' (%s:%d) disconnected cleanly.\n",
@@ -325,103 +383,72 @@ void *client_handler_thread(void *arg) {
             break;
         }
 
-        // Step B: Read Payload (trusting header.length)
         char *payload = NULL;
         if (header.length > 0) {
             payload = malloc((size_t)header.length + 1);
-            if (!payload) {
-                fprintf(stderr, "Memory allocation failed for payload length %d\n", header.length);
-                break;
-            }
+            if (!payload) break;
 
             if (read_payload(client_fd, payload, (size_t)header.length) < 0) {
-                printf("[-] Error reading payload (%d bytes) from client '%s'.\n",
-                       header.length, entry->username);
+                printf("[-] Error reading payload (%d bytes) from '%s'.\n", header.length, entry->username);
                 free(payload);
                 break;
             }
-            payload[header.length] = '\0'; // Safe null-termination
+            payload[header.length] = '\0';
         }
 
-        // Step C: Process messages using switch(header.type)
         switch (header.type) {
             case CHAT: {
-                printf("[CHAT | %s (%s:%d)]: %s",
-                       entry->username, client_ip, client_port, payload ? payload : "");
+                printf("[%s (%s:%d)]: %s", entry->username, client_ip, client_port, payload ? payload : "");
                 if (payload && header.length > 0 && payload[header.length - 1] != '\n') {
                     printf("\n");
                 }
-
-                // Broadcast CHAT message to other clients
-                broadcast_packet(client_fd, header, payload);
-                break;
-            }
-
-            case USER_JOIN: {
-                if (payload && header.length > 0) {
-                    pthread_mutex_lock(&clients_mutex);
-                    strncpy(entry->username, payload, MAX_USERNAME - 1);
-                    entry->username[MAX_USERNAME - 1] = '\0';
-                    pthread_mutex_unlock(&clients_mutex);
-                }
-                printf("[USER_JOIN] Client on FD %d registered username: '%s'\n", client_fd, entry->username);
                 broadcast_packet(client_fd, header, payload);
                 break;
             }
 
             case USER_LEAVE: {
-                printf("[USER_LEAVE] Client '%s' (FD: %d) sent leave signal.\n",
-                       entry->username, client_fd);
-                broadcast_packet(client_fd, header, payload);
+                printf("[USER_LEAVE] Client '%s' sent leave packet.\n", entry->username);
                 break;
             }
 
             case FILE_START: {
-                printf("[FILE_START] Received file metadata from '%s' (%d bytes payload)\n",
-                       entry->username, header.length);
-                if (header.length >= (int32_t)sizeof(FileStartPayload)) {
-                    FileStartPayload *meta = (FileStartPayload *)payload;
-                    printf("             File: '%s' | Sender: '%s' -> Target: '%s'\n",
-                           meta->filename, meta->sender_username, meta->target_username);
-                }
+                printf("[FILE_START] File metadata from '%s' (%d bytes)\n", entry->username, header.length);
                 broadcast_packet(client_fd, header, payload);
                 break;
             }
 
             case FILE_CHUNK: {
-                printf("[FILE_CHUNK] Relaying file chunk (%d bytes) from '%s'\n",
-                       header.length, entry->username);
+                printf("[FILE_CHUNK] Relaying file chunk (%d bytes) from '%s'\n", header.length, entry->username);
                 broadcast_packet(client_fd, header, payload);
                 break;
             }
 
             case FILE_END: {
-                printf("[FILE_END] Received file transfer complete signal from '%s'\n",
-                       entry->username);
+                printf("[FILE_END] File transfer complete signal from '%s'\n", entry->username);
                 broadcast_packet(client_fd, header, payload);
                 break;
             }
 
-            default: {
-                printf("[UNKNOWN PACKET] Unknown header type %d (length: %d) from '%s'\n",
-                       header.type, header.length, entry->username);
+            default:
+                printf("[UNKNOWN] Header type %d from '%s'\n", header.type, entry->username);
                 break;
-            }
         }
 
-        if (payload) {
-            free(payload);
-        }
+        if (payload) free(payload);
 
         if (header.type == USER_LEAVE) {
             break;
         }
     }
 
-    // Cleanup client entry
+    // Save username copy for post-cleanup log and broadcast
     char username_copy[MAX_USERNAME];
     strncpy(username_copy, entry->username, MAX_USERNAME - 1);
     username_copy[MAX_USERNAME - 1] = '\0';
+
+    // Requirement: Broadcast "[username] left" on disconnect
+    printf("[BROADCAST EVENT] '%s' left the chat.\n", username_copy);
+    broadcast_user_event(client_fd, USER_LEAVE, username_copy);
 
     remove_client(client_fd);
     close(client_fd);
@@ -438,7 +465,7 @@ void *client_handler_thread(void *arg) {
 void accept_clients_loop(int server_fd) {
     printf("=====================================================\n");
     printf("  Structured TCP Server listening on port %d...\n", PORT);
-    printf("  Protocol: Header (8B) + Payload | Max Clients: %d\n", MAX_CLIENTS);
+    printf("  Max Clients: %d | Username Check: Atomic Mutex\n", MAX_CLIENTS);
     printf("  Waiting for incoming client connections...\n");
     printf("=====================================================\n\n");
 
@@ -456,33 +483,23 @@ void accept_clients_loop(int server_fd) {
         inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, sizeof(client_ip));
         int client_port = ntohs(client_addr.sin_port);
 
-        char placeholder_name[MAX_USERNAME];
-        snprintf(placeholder_name, sizeof(placeholder_name), "Guest_%d", client_fd);
+        printf("[Main Thread] Accepted connection from %s:%d (FD: %d). Spawning worker thread...\n",
+               client_ip, client_port, client_fd);
 
-        client_entry_t *entry = add_client(client_fd, client_addr, placeholder_name);
-        if (entry == NULL) {
-            // Rejection Packet
-            Header reject_header = { .type = CHAT, .length = 74 };
-            const char *reject_msg = "SERVER REJECTION: Maximum client limit (100) reached. Connection closed.\n";
-            write_exact(client_fd, &reject_header, sizeof(Header));
-            write_exact(client_fd, reject_msg, strlen(reject_msg));
-
-            printf("[REJECTED] Client %s:%d (FD: %d) rejected - Server full (%d/%d clients).\n",
-                   client_ip, client_port, client_fd, MAX_CLIENTS, MAX_CLIENTS);
-
+        temp_client_info_t *temp_info = malloc(sizeof(temp_client_info_t));
+        if (!temp_info) {
             close(client_fd);
             continue;
         }
-
-        printf("[Main Thread] Accepted client '%s' from %s:%d (FD: %d). Spawning worker thread...\n",
-               entry->username, client_ip, client_port, client_fd);
+        temp_info->client_fd = client_fd;
+        temp_info->client_addr = client_addr;
 
         pthread_t tid;
-        int rc = pthread_create(&tid, NULL, client_handler_thread, entry);
+        int rc = pthread_create(&tid, NULL, client_handler_thread, temp_info);
         if (rc != 0) {
             fprintf(stderr, "Failed to create thread: %s\n", strerror(rc));
-            remove_client(client_fd);
             close(client_fd);
+            free(temp_info);
             continue;
         }
     }

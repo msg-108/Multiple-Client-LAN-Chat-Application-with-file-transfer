@@ -1,0 +1,14 @@
+[Step 1] Socket created successfully (FD: 3)
+[Step 2] Bound successfully to port 8080
+[Step 3] Multithreaded server listening with backlog queue of 10
+
+=====================================================
+  Structured TCP Server listening on port 8080...
+  Max Clients: 100 | Username Check: Atomic Mutex
+  Waiting for incoming client connections...
+=====================================================
+
+[Main Thread] Accepted connection from 127.0.0.1:42054 (FD: 4). Spawning worker thread...
+[Worker Thread 128189913364160] [+] Client 'User_8367' registered: 127.0.0.1:42054 (FD: 4) [Connected: 1/100]
+[BROADCAST EVENT] 'User_8367' joined the chat.
+[User_8367 (127.0.0.1:42054)]: First
