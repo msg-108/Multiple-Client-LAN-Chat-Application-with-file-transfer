@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include "protocol.h"
+#include "utils.h"
 
 #define DEFAULT_IP   "127.0.0.1"
 #define DEFAULT_PORT 8080
@@ -17,57 +18,21 @@
 static volatile int is_running = 1;
 
 /**
- * Reads EXACTLY `len` bytes from socket file descriptor.
- */
-ssize_t read_exact(int fd, void *buf, size_t len) {
-    size_t total_read = 0;
-    char *ptr = (char *)buf;
-
-    while (total_read < len) {
-        ssize_t bytes_read = recv(fd, ptr + total_read, len - total_read, 0);
-        if (bytes_read > 0) {
-            total_read += bytes_read;
-        } else if (bytes_read == 0) {
-            return (total_read == 0) ? 0 : -1;
-        } else {
-            return -1;
-        }
-    }
-    return (ssize_t)total_read;
-}
-
-/**
- * Writes EXACTLY `len` bytes to socket file descriptor.
- */
-ssize_t write_exact(int fd, const void *buf, size_t len) {
-    size_t total_written = 0;
-    const char *ptr = (const char *)buf;
-
-    while (total_written < len) {
-        ssize_t bytes_written = send(fd, ptr + total_written, len - total_written, MSG_NOSIGNAL);
-        if (bytes_written > 0) {
-            total_written += bytes_written;
-        } else {
-            return -1;
-        }
-    }
-    return (ssize_t)total_written;
-}
-
-/**
- * Sends a structured message (Header + Payload) to server.
+ * Sends a structured message (Header + Payload) using send_all().
  */
 int send_packet(int sock_fd, int32_t type, const void *payload, int32_t payload_len) {
     Header header;
     header.type = type;
     header.length = payload_len;
 
-    if (write_exact(sock_fd, &header, sizeof(Header)) < 0) {
+    // Send Header using send_all()
+    if (send_all(sock_fd, &header, (int)sizeof(Header)) < 0) {
         return -1;
     }
 
+    // Send Payload using send_all()
     if (payload_len > 0 && payload != NULL) {
-        if (write_exact(sock_fd, payload, (size_t)payload_len) < 0) {
+        if (send_all(sock_fd, (void *)payload, payload_len) < 0) {
             return -1;
         }
     }
@@ -78,34 +43,30 @@ int send_packet(int sock_fd, int32_t type, const void *payload, int32_t payload_
 /**
  * Receiver Worker Thread Routine
  * 
- * Displays incoming broadcast messages formatted as "[username]: message" or system events.
+ * Uses recv_all() for all Header and Payload I/O.
  */
 void *receive_handler_thread(void *arg) {
     int sock_fd = (int)(intptr_t)arg;
     Header header;
 
     while (is_running) {
-        // Read Header (8 bytes)
-        ssize_t h_res = read_exact(sock_fd, &header, sizeof(Header));
-        if (h_res <= 0) {
+        // Read Header (8 bytes) using recv_all()
+        int h_res = recv_all(sock_fd, &header, (int)sizeof(Header));
+        if (h_res < 0) {
             if (is_running) {
-                if (h_res == 0) {
-                    printf("\n[-] Server disconnected.\n");
-                } else {
-                    printf("\n[-] Error reading header from server.\n");
-                }
+                printf("\n[-] Server disconnected or read error.\n");
                 is_running = 0;
             }
             break;
         }
 
-        // Read Payload (trusting header.length)
+        // Read Payload trusting header.length using recv_all()
         char *payload = NULL;
         if (header.length > 0) {
             payload = malloc((size_t)header.length + 1);
             if (!payload) break;
 
-            if (read_exact(sock_fd, payload, (size_t)header.length) <= 0) {
+            if (recv_all(sock_fd, payload, header.length) < 0) {
                 free(payload);
                 if (is_running) {
                     printf("\n[-] Error reading payload from server.\n");
@@ -119,7 +80,6 @@ void *receive_handler_thread(void *arg) {
         // Display incoming message types
         switch (header.type) {
             case CHAT:
-                // Display incoming chat message: "[username]: message"
                 printf("%s", payload ? payload : "");
                 if (payload && header.length > 0 && payload[header.length - 1] != '\n') {
                     printf("\n");
@@ -179,7 +139,6 @@ int connect_to_server(int sock_fd, const char *ip, int port) {
 }
 
 int main(int argc, char *argv[]) {
-    // Unbuffer stdout and stderr so prompts display instantly
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
 
@@ -187,11 +146,6 @@ int main(int argc, char *argv[]) {
     int port = DEFAULT_PORT;
     const char *cli_username = NULL;
 
-    // Flexible Command Line Argument Parsing:
-    // Usage 1: ./client (prompts interactively for username)
-    // Usage 2: ./client Alice (connects to 127.0.0.1:8080 as Alice)
-    // Usage 3: ./client 127.0.0.1 8080 (prompts interactively for username)
-    // Usage 4: ./client 127.0.0.1 8080 Alice (connects to 127.0.0.1:8080 as Alice)
     if (argc == 2) {
         cli_username = argv[1];
     } else if (argc == 3) {
@@ -228,7 +182,6 @@ int main(int argc, char *argv[]) {
             strncpy(username, cli_username, MAX_USERNAME - 1);
             username[MAX_USERNAME - 1] = '\0';
         } else {
-            // Display interactive username prompt and flush output buffer
             printf("Enter your username (max %d chars): ", MAX_USERNAME - 1);
             fflush(stdout);
 
@@ -238,7 +191,6 @@ int main(int argc, char *argv[]) {
                 exit(EXIT_SUCCESS);
             }
 
-            // Strip trailing newlines / carriage returns
             size_t len = strlen(username);
             while (len > 0 && (username[len - 1] == '\n' || username[len - 1] == '\r')) {
                 username[--len] = '\0';
@@ -250,33 +202,32 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // Send USER_JOIN registration packet immediately after connecting
+        // Send USER_JOIN registration packet via send_all()
         if (send_packet(sock_fd, USER_JOIN, username, (int32_t)strlen(username)) < 0) {
             perror("[-] Error sending username registration packet");
             close(sock_fd);
             exit(EXIT_FAILURE);
         }
 
-        // Check for immediate server rejection packet (e.g. duplicate username or server full)
+        // Check for immediate server response
         struct timeval tv;
         tv.tv_sec = 0;
-        tv.tv_usec = 200000; // 200ms timeout check
+        tv.tv_usec = 200000; // 200ms
         setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         Header resp_header;
-        ssize_t h_res = read_exact(sock_fd, &resp_header, sizeof(Header));
+        int h_res = recv_all(sock_fd, &resp_header, (int)sizeof(Header));
 
-        // Reset socket timeout back to normal
         tv.tv_sec = 0;
         tv.tv_usec = 0;
         setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-        if (h_res == (ssize_t)sizeof(Header)) {
+        if (h_res == (int)sizeof(Header)) {
             char *resp_payload = NULL;
             if (resp_header.length > 0) {
                 resp_payload = malloc((size_t)resp_header.length + 1);
                 if (resp_payload) {
-                    read_exact(sock_fd, resp_payload, (size_t)resp_header.length);
+                    recv_all(sock_fd, resp_payload, resp_header.length);
                     resp_payload[resp_header.length] = '\0';
                 }
             }
@@ -286,9 +237,8 @@ int main(int argc, char *argv[]) {
                 if (resp_payload[strlen(resp_payload) - 1] != '\n') printf("\n");
                 free(resp_payload);
 
-                // Reset cli_username to force interactive prompt for entering a new name
-                cli_username = NULL;
-                continue; // Retry registration!
+                cli_username = NULL; // Force interactive prompt for retry
+                continue;
             }
 
             if (resp_payload) free(resp_payload);
@@ -299,7 +249,7 @@ int main(int argc, char *argv[]) {
 
     printf("[+] Registered successfully as '%s'!\n\n", username);
 
-    // 4. Spawn Receiver Thread using pthreads for non-blocking server message broadcasts
+    // 4. Spawn Receiver Thread using pthreads
     pthread_t recv_thread;
     if (pthread_create(&recv_thread, NULL, receive_handler_thread, (void *)(intptr_t)sock_fd) != 0) {
         perror("Failed to create receiving thread");

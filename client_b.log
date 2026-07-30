@@ -1,9 +1,0 @@
-Attempting to connect to server at 127.0.0.1:8080...
-Connected to server at 127.0.0.1:8080!
-==================================================
-  Interactive Client Terminal Connected
-  Type messages and press ENTER to send.
-  Type /quit or /exit to disconnect.
-==================================================
-
-Connection closed gracefully.
