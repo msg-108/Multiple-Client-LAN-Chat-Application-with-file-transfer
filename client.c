@@ -74,13 +74,14 @@ int send_packet(int sock_fd, int32_t type, const void *payload, int32_t payload_
 }
 
 /**
- * Sends a file from client to target user with in-place (\r) progress indicator.
+ * Sends a file from client to target user with full error handling for target file not found & mid-transfer disconnects.
  */
 int send_file_to_user(int sock_fd, const char *sender_name, const char *target_name, const char *filepath) {
+    // 1. Target file not found (sender side, before FILE_START)
     FILE *fp = fopen(filepath, "rb");
     if (!fp) {
-        perror("[CLIENT ERROR] Failed to open file for reading");
-        printf("[CLIENT ERROR] Aborting file transfer for '%s' (file not found or permission denied).\n", filepath);
+        perror("[CLIENT ERROR] Target file not found or permission denied");
+        printf("[CLIENT ERROR] Aborting file transfer: Could not open '%s'.\n", filepath);
         return -1;
     }
 
@@ -113,11 +114,12 @@ int send_file_to_user(int sock_fd, const char *sender_name, const char *target_n
     int bytes_read = 0;
     int64_t total_bytes_sent = 0;
 
+    // 3. Connection interrupted mid-transfer (sender side handling)
     while ((bytes_read = read_file_chunk(fp, chunk_buffer, CHUNK_SIZE)) > 0) {
         Header chunk_header = { .type = FILE_CHUNK, .length = bytes_read };
         if (send_all(sock_fd, &chunk_header, (int)sizeof(Header)) < 0 ||
             send_all(sock_fd, chunk_buffer, bytes_read) < 0) {
-            perror("\n[CLIENT ERROR] Error sending FILE_CHUNK packet");
+            printf("\n[CLIENT ERROR] Connection interrupted mid-transfer while sending '%s'. Aborting.\n", basename);
             fclose(fp);
             return -1;
         }
@@ -134,7 +136,7 @@ int send_file_to_user(int sock_fd, const char *sender_name, const char *target_n
 
     Header end_header = { .type = FILE_END, .length = 0 };
     if (send_all(sock_fd, &end_header, (int)sizeof(Header)) < 0) {
-        perror("[CLIENT ERROR] Failed to send FILE_END packet");
+        printf("[CLIENT ERROR] Connection interrupted while sending FILE_END for '%s'.\n", basename);
         return -1;
     }
 
@@ -144,25 +146,22 @@ int send_file_to_user(int sock_fd, const char *sender_name, const char *target_n
 }
 
 /**
- * Receiver Worker Thread Routine with Comprehensive Error Handling.
+ * Receiver Worker Thread Routine with Partial File Cleanup on Error.
  */
 void *receive_handler_thread(void *arg) {
     int sock_fd = (int)(intptr_t)arg;
     Header header;
 
     while (is_running) {
-        // Read Header (8 bytes) using recv_all()
         int h_res = recv_all(sock_fd, &header, (int)sizeof(Header));
         if (h_res < 0) {
             if (is_running) {
-                // Requirement 1: Server unexpectedly closing connection detection
                 printf("\n[CLIENT ERROR] Server unexpectedly closed the connection.\n");
                 is_running = 0;
             }
             break;
         }
 
-        // Requirement 2: Malformed / unexpected message length validation
         if (!is_client_payload_valid(header.type, header.length)) {
             printf("\n[CLIENT WARNING] Malformed packet received from server (type: %d, length: %d). Ignoring packet.\n",
                    header.type, header.length);
@@ -176,7 +175,6 @@ void *receive_handler_thread(void *arg) {
             continue;
         }
 
-        // Read Payload safely
         char *payload = NULL;
         if (header.length > 0) {
             payload = malloc((size_t)header.length + 1);
@@ -196,9 +194,9 @@ void *receive_handler_thread(void *arg) {
             payload[header.length] = '\0';
         }
 
-        // Requirement 2: Malformed/unexpected message type handling
         switch (header.type) {
             case CHAT:
+                // Displays CHAT messages or Server Error Rejections (e.g. Target username not connected)
                 printf("%s", payload ? payload : "");
                 if (payload && header.length > 0 && payload[header.length - 1] != '\n') {
                     printf("\n");
@@ -222,6 +220,7 @@ void *receive_handler_thread(void *arg) {
                     
                     if (active_recv_fp != NULL) {
                         fclose(active_recv_fp);
+                        remove(active_recv_filename); // Clean up any previous unclosed file
                         active_recv_fp = NULL;
                     }
 
@@ -259,13 +258,21 @@ void *receive_handler_thread(void *arg) {
                 if (active_recv_fp != NULL) {
                     fclose(active_recv_fp);
                     active_recv_fp = NULL;
-                    printf("\nFile transfer complete for '%s' from '%s'!\n", active_recv_filename, active_recv_sender);
+
+                    // 3. Connection interrupted mid-transfer (incomplete file cleanup)
+                    if (active_recv_total_size > 0 && active_recv_current_bytes < active_recv_total_size) {
+                        remove(active_recv_filename); // Remove incomplete corrupt file
+                        printf("\n[CLIENT ERROR] File transfer of '%s' from '%s' was interrupted prematurely (%ld/%ld bytes received). Incomplete file removed.\n",
+                               active_recv_filename, active_recv_sender, (long)active_recv_current_bytes, (long)active_recv_total_size);
+                    } else {
+                        printf("\nFile transfer complete for '%s' from '%s' (%ld bytes)!\n",
+                               active_recv_filename, active_recv_sender, (long)active_recv_current_bytes);
+                    }
                     fflush(stdout);
                 }
                 break;
 
             default:
-                // Requirement 2: Unexpected message type handling without crashing
                 printf("\n[CLIENT WARNING] Malformed or unknown message type %d (%d bytes) received from server. Ignored.\n",
                        header.type, header.length);
                 fflush(stdout);
@@ -275,10 +282,12 @@ void *receive_handler_thread(void *arg) {
         if (payload) free(payload);
     }
 
+    // 3. Connection dropped mid-transfer cleanup
     if (active_recv_fp != NULL) {
         fclose(active_recv_fp);
         active_recv_fp = NULL;
-        printf("\n[CLIENT ERROR] File transfer of '%s' from '%s' was interrupted due to connection drop.\n",
+        remove(active_recv_filename); // Delete incomplete partial file
+        printf("\n[CLIENT ERROR] Connection dropped mid-transfer of '%s' from '%s'. Incomplete file removed.\n",
                active_recv_filename, active_recv_sender);
         fflush(stdout);
     }
@@ -445,7 +454,6 @@ int main(int argc, char *argv[]) {
         }
         if (len == 0) continue;
 
-        // Requirement 3: Parse input before deciding what to send & handle invalid input
         if (input_buffer[0] == '/') {
             if (strcmp(input_buffer, "/quit") == 0 || strcmp(input_buffer, "/exit") == 0) {
                 printf("[CLIENT] Sending USER_LEAVE packet and disconnecting...\n");
@@ -499,7 +507,6 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Requirement 4: Ensure client prints a clear message and exits cleanly
     is_running = 0;
     close(sock_fd);
     pthread_join(recv_thread, NULL);

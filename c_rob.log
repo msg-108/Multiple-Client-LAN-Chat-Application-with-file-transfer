@@ -16,3 +16,5 @@ Connected to server at 127.0.0.1:8080!
 [-] ErrUser left the chat
 [+] TestUser joined the chat
 [-] TestUser left the chat
+
+[-] Server disconnected or read error.
