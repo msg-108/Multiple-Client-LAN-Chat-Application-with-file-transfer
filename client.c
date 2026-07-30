@@ -5,15 +5,67 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <pthread.h>
+#include <stdint.h>
 
 #define DEFAULT_IP   "127.0.0.1"
 #define DEFAULT_PORT 8080
 #define BUFFER_SIZE  1024
 
+// State flag to signal thread shutdown
+static volatile int is_running = 1;
+
+/**
+ * Receiver Worker Thread Routine
+ * 
+ * Requirement: Add a second thread using pthreads.
+ * - Thread continuously calls recv() from server.
+ * - Prints received messages to terminal.
+ * - Receiving thread handles output (stdout).
+ * 
+ * @param arg Socket file descriptor cast to void*.
+ */
+void *receive_handler_thread(void *arg) {
+    int sock_fd = (int)(intptr_t)arg;
+    char buffer[BUFFER_SIZE];
+    ssize_t bytes_received;
+
+    while (is_running) {
+        // Continuously read data sent by server
+        bytes_received = recv(sock_fd, buffer, BUFFER_SIZE - 1, 0);
+
+        if (bytes_received > 0) {
+            buffer[bytes_received] = '\0'; // Null-terminate string
+            // Print server output to terminal
+            printf("%s", buffer);
+            if (buffer[bytes_received - 1] != '\n') {
+                printf("\n");
+            }
+            fflush(stdout);
+        } else if (bytes_received == 0) {
+            // Server disconnected or rejected connection
+            if (is_running) {
+                printf("\n[-] Server disconnected.\n");
+                is_running = 0;
+            }
+            break;
+        } else {
+            // Socket read error or closed by main thread
+            if (is_running) {
+                perror("[-] recv error");
+                is_running = 0;
+            }
+            break;
+        }
+    }
+
+    return NULL;
+}
+
 /**
  * Creates an IPv4 stream socket (TCP).
  * 
- * @return File descriptor of the created socket, or -1 on error.
+ * @return File descriptor of created socket, or -1 on error.
  */
 int create_client_socket(void) {
     int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -25,12 +77,12 @@ int create_client_socket(void) {
 }
 
 /**
- * Prepares server address structure and connects to server using connect().
+ * Connects to server using IP and port via connect().
  * 
  * @param sock_fd Socket file descriptor.
- * @param ip Server IP address string.
+ * @param ip Server IP address.
  * @param port Server port number.
- * @return 0 on success, -1 on failure.
+ * @return 0 on success, -1 on error.
  */
 int connect_to_server(int sock_fd, const char *ip, int port) {
     struct sockaddr_in server_addr;
@@ -52,7 +104,16 @@ int connect_to_server(int sock_fd, const char *ip, int port) {
     return 0;
 }
 
+/**
+ * Main Thread Handler
+ * 
+ * Constraint: Main thread handles input (stdin).
+ */
 int main(int argc, char *argv[]) {
+    // Unbuffer standard streams for responsive terminal display
+    setbuf(stdout, NULL);
+    setbuf(stderr, NULL);
+
     const char *server_ip = (argc > 1) ? argv[1] : DEFAULT_IP;
     int port = (argc > 2) ? atoi(argv[2]) : DEFAULT_PORT;
 
@@ -72,30 +133,50 @@ int main(int argc, char *argv[]) {
 
     printf("Connected to server at %s:%d!\n", server_ip, port);
 
-    // 3. Send sample messages or interactive user input to server
+    // 3. Create Receiver Thread using pthreads for server output
+    pthread_t recv_thread;
+    if (pthread_create(&recv_thread, NULL, receive_handler_thread, (void *)(intptr_t)sock_fd) != 0) {
+        perror("Failed to create receiving thread");
+        close(sock_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    // 4. Main Thread Input Loop
     if (argc > 3) {
-        // Send custom message provided as command line argument
+        // Non-interactive mode: Send message specified in command line argument
         const char *msg = argv[3];
         printf("Sending message: %s\n", msg);
         send(sock_fd, msg, strlen(msg), 0);
+        usleep(300000); // 300ms pause to allow receiver thread to process replies
     } else {
-        // Send default messages
-        const char *msg1 = "Hello, Server! (Message 1)\n";
-        const char *msg2 = "Sending second message before disconnect.\n";
+        // Interactive mode: Read user input from stdin
+        printf("==================================================\n");
+        printf("  Interactive Client Terminal Connected\n");
+        printf("  Type messages and press ENTER to send.\n");
+        printf("  Type /quit or /exit to disconnect.\n");
+        printf("==================================================\n\n");
 
-        printf("Sending message 1: %s", msg1);
-        send(sock_fd, msg1, strlen(msg1), 0);
+        char input_buffer[BUFFER_SIZE];
+        while (is_running && fgets(input_buffer, sizeof(input_buffer), stdin) != NULL) {
+            // Check for exit command
+            if (strncmp(input_buffer, "/quit", 5) == 0 || strncmp(input_buffer, "/exit", 5) == 0) {
+                printf("Disconnecting from server...\n");
+                break;
+            }
 
-        usleep(100000); // 100ms pause between messages
-
-        printf("Sending message 2: %s", msg2);
-        send(sock_fd, msg2, strlen(msg2), 0);
+            // Send message to server
+            if (send(sock_fd, input_buffer, strlen(input_buffer), 0) < 0) {
+                perror("[-] Send failed");
+                break;
+            }
+        }
     }
 
-    // 4. Gracefully close connection on exit (sends TCP FIN to trigger recv() returning 0 on server)
-    printf("Closing connection gracefully...\n");
-    close(sock_fd);
-    printf("Connection closed.\n");
+    // Graceful Shutdown
+    is_running = 0;
+    close(sock_fd); // Close socket descriptor to unblock recv() in receiving thread
+    pthread_join(recv_thread, NULL); // Wait for receiving thread to complete
 
+    printf("Connection closed gracefully.\n");
     return 0;
 }

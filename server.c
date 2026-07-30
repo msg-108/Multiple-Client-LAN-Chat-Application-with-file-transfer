@@ -12,9 +12,7 @@
 #define BACKLOG     10
 #define BUFFER_SIZE 1024
 
-/**
- * Structure representing a connected client entry in the global list
- */
+// Structure representing a connected client entry in the global list
 typedef struct {
     int socket_fd;
     char username[MAX_USERNAME];
@@ -96,6 +94,62 @@ int get_client_count(void) {
     int count = client_count;
     pthread_mutex_unlock(&clients_mutex);
     return count;
+}
+
+/**
+ * Broadcasts a message from sender to all other connected clients.
+ * 
+ * Constraint Enforcement:
+ * 1. Lock clients_mutex ONLY to copy target socket descriptors into local array.
+ * 2. Release clients_mutex BEFORE invoking send() on any socket.
+ * 3. Safely handle failed send() by removing disconnected target clients without crashing.
+ * 
+ * @param sender_fd Socket descriptor of client sending the message.
+ * @param sender_username Username string of sender.
+ * @param message Message content buffer.
+ */
+void broadcast_message(int sender_fd, const char *sender_username, const char *message) {
+    int target_sockets[MAX_CLIENTS];
+    int target_count = 0;
+
+    // 1. Lock mutex ONLY long enough to snapshot target client socket descriptors
+    pthread_mutex_lock(&clients_mutex);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i] != NULL && clients[i]->socket_fd != sender_fd) {
+            target_sockets[target_count++] = clients[i]->socket_fd;
+        }
+    }
+    // RELEASE mutex before sending data!
+    pthread_mutex_unlock(&clients_mutex);
+
+    if (target_count == 0) {
+        return; // No other clients connected
+    }
+
+    // Format broadcast payload string
+    char formatted_msg[BUFFER_SIZE + MAX_USERNAME + 16];
+    snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s", sender_username, message);
+    size_t msg_len = strlen(formatted_msg);
+
+    printf("[BROADCAST] Relaying message from '%s' (FD: %d) to %d recipient(s)...\n",
+           sender_username, sender_fd, target_count);
+
+    // 2. Perform send() calls OUTSIDE the mutex lock
+    for (int i = 0; i < target_count; i++) {
+        int dest_fd = target_sockets[i];
+
+        // Send message to target client (MSG_NOSIGNAL prevents SIGPIPE crash if client disconnected)
+        ssize_t bytes_sent = send(dest_fd, formatted_msg, msg_len, MSG_NOSIGNAL);
+
+        if (bytes_sent < 0) {
+            // Handle send failure safely: remove broken socket and close connection
+            perror("[BROADCAST ERROR] send() failed for destination socket");
+            printf("[BROADCAST ERROR] Removing unresponsive client (FD: %d)\n", dest_fd);
+
+            remove_client(dest_fd);
+            close(dest_fd);
+        }
+    }
 }
 
 /**
@@ -182,6 +236,9 @@ void *client_handler_thread(void *arg) {
         if (buffer[bytes_received - 1] != '\n') {
             printf("\n");
         }
+
+        // Broadcast message to all other connected clients
+        broadcast_message(client_fd, entry->username, buffer);
     }
 
     // Handle client disconnect or connection error
