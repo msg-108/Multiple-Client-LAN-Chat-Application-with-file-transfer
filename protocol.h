@@ -29,6 +29,7 @@ typedef struct {
     char sender_username[MAX_USERNAME];  // who is sending (for the receiver's UI)
     char target_username[MAX_USERNAME];  // who the server should route this to
     char filename[MAX_FILENAME];         // original filename, receiver saves under this
+    int64_t file_size;                   // total file size in bytes for progress indicator
 } FileStartPayload;
 
 // FILE_CHUNK payload is raw binary data. Header.length is the ACTUAL size
