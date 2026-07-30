@@ -415,8 +415,12 @@ int main(int argc, char *argv[]) {
             if (resp_header.length > 0) {
                 resp_payload = malloc((size_t)resp_header.length + 1);
                 if (resp_payload) {
-                    recv_all(sock_fd, resp_payload, resp_header.length);
-                    resp_payload[resp_header.length] = '\0';
+                    if (recv_all(sock_fd, resp_payload, resp_header.length) < 0) {
+                        free(resp_payload);
+                        resp_payload = NULL;
+                    } else {
+                        resp_payload[resp_header.length] = '\0';
+                    }
                 }
             }
 
