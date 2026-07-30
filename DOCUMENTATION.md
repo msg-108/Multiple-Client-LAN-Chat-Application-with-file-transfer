@@ -93,7 +93,7 @@ The client implements specific slash commands:
 Any input not starting with a known slash command is treated as a standard chat broadcast.
 
 **Username Handling Flow**:
-Upon launch, the client prompts for a username, sends a `USER_JOIN` packet, and explicitly sets a socket timeout (`SO_RCVTIMEO`) to wait for a response. If the server rejects the name (duplicate/full), the server sends a `CHAT` packet containing "ERROR:". The client parses this, displays the rejection, and re-prompts the user in a `while(!registered)` loop.
+Upon launch, the client prompts for a username, sends a `USER_JOIN` packet, and explicitly sets a socket timeout (`SO_RCVTIMEO`) to wait for a response. If the server rejects the name (duplicate/full), the server sends a `CHAT` packet containing "ERROR:" and intentionally closes the connection. The client parses this, displays the rejection, cleanly closes its stale socket, transparently re-establishes a brand new TCP connection to the server, and re-prompts the user in a `while(!registered)` loop, preventing broken pipe errors.
 
 ---
 

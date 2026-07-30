@@ -55,8 +55,8 @@ The goal of testing is to verify that:
 
 ### TC-03: Duplicate Username Rejection
 - **Inputs**: `Client 1` connects as `Alice`. `Client 2` connects as `Alice`.
-- **Expected Result**: Server rejects `Client 2` under `clients_mutex` with `ERROR: Username 'Alice' is already taken. Connection rejected.`. `Client 2` prompts user to enter a different name.
-- **Actual Result**: `Client 2` outputs `[REJECTED] ERROR: Username 'Alice' is already taken.` and prompts `Enter your username (max 31 chars): `.
+- **Expected Result**: Server rejects `Client 2` under `clients_mutex` with `ERROR: Username 'Alice' is already taken. Connection rejected.`. `Client 2` closes the stale socket, transparently establishes a new TCP connection to the server, and prompts the user to enter a different name without encountering a Broken Pipe error.
+- **Actual Result**: `Client 2` outputs `[REJECTED] ERROR: Username 'Alice' is already taken.`, reconnects cleanly, and prompts `Enter your username (max 31 chars): `.
 - **Status**: **PASS**
 
 ---

@@ -18,6 +18,7 @@ A multithreaded TCP client-server chat application written in standard C (C11, P
 - **Progress Indicators**: Displays in-place (`\r`) percentage and byte count progress updates during file upload and download.
 - **Robust Error Handling**:
   - Handles target file not found before sending `FILE_START`.
+  - Automatically establishes a new connection transparently if the server rejects a username (e.g., duplicate or full) to prevent broken pipe errors on retry.
   - Rejects oversized or negative packet headers without allocating memory.
   - Automatically deletes corrupted partial files on the receiver end if a transfer is interrupted mid-stream.
   - Fault isolation (`SIGPIPE` ignored): One client's disconnect or failure never crashes the server.

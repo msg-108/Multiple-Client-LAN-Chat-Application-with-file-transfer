@@ -326,6 +326,16 @@ int connect_to_server(int sock_fd, const char *ip, int port) {
     return 0;
 }
 
+int establish_connection(const char *server_ip, int port) {
+    int sock_fd = create_client_socket();
+    if (sock_fd < 0) return -1;
+    if (connect_to_server(sock_fd, server_ip, port) < 0) {
+        close(sock_fd);
+        return -1;
+    }
+    return sock_fd;
+}
+
 int main(int argc, char *argv[]) {
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
@@ -347,13 +357,8 @@ int main(int argc, char *argv[]) {
 
     printf("Connecting to server at %s:%d...\n", server_ip, port);
 
-    int sock_fd = create_client_socket();
+    int sock_fd = establish_connection(server_ip, port);
     if (sock_fd < 0) {
-        exit(EXIT_FAILURE);
-    }
-
-    if (connect_to_server(sock_fd, server_ip, port) < 0) {
-        close(sock_fd);
         exit(EXIT_FAILURE);
     }
 
@@ -421,6 +426,15 @@ int main(int argc, char *argv[]) {
                 free(resp_payload);
 
                 cli_username = NULL;
+
+                close(sock_fd);
+                printf("\nReconnecting to server for another attempt...\n");
+                sock_fd = establish_connection(server_ip, port);
+                if (sock_fd < 0) {
+                    printf("[CLIENT ERROR] Failed to reconnect to server after rejection.\n");
+                    exit(EXIT_FAILURE);
+                }
+
                 continue;
             }
 
