@@ -210,6 +210,14 @@ Open additional terminals and run:
 9. **Q**: Walk me through what happens step-by-step when a sender forcefully closes their terminal (disconnects) when a file transfer is only 50% complete.
    **A**: The sender socket closes. The server `recv_all` fails, returning -1. The server thread notices `active_file_target_fd > 0`, meaning a transfer was interrupted. It synthesizes a `FILE_END` header and pushes it to the receiver. The receiver gets `FILE_END`, sees `current_bytes < total_size`, realizes the transfer is corrupted, closes the file, calls `remove(filename)` to delete the partial file, and prints a warning.
 
+### Advanced / Deep-Dive Questions
+10. **Q**: In `client.c`, the `is_running` flag is declared as `atomic_int` using `<stdatomic.h>`. Why was this chosen over a simple `volatile int`?
+    **A**: Under the C11 standard, accessing a shared plain or `volatile int` from multiple threads without a mutex constitutes a data race. While `volatile` prevents the compiler from caching the read in a register, it does not provide memory barriers or atomic guarantees at the CPU hardware level (especially on weakly-ordered architectures like ARM). By using C11's `<stdatomic.h>` and `atomic_int`, the code is strictly standard-compliant and guarantees thread-safe, lock-free access across all CPU architectures.
+11. **Q**: In `server.c`, `remove_client()` calls `free()` on the client entry. How do you prevent use-after-free bugs if another thread is looking up a client at the exact same time?
+    **A**: We prevent this by ensuring no thread ever passes or holds a `client_entry_t*` pointer belonging to another thread. Functions like `find_client_socket_by_username()` and `broadcast_packet()` read the registry under the `clients_mutex` lock, but they *only copy out the integer socket file descriptor*, never the struct pointer. The only thread that holds a pointer to a client entry is the worker thread that owns it, and it copies out necessary data (like the username) into local stack variables *before* calling `remove_client()`.
+12. **Q**: Are you certain your duplicate username check in `add_client()` is atomic? What proves it?
+    **A**: Yes. The `pthread_mutex_lock(&clients_mutex)` is acquired at the start of the function and held continuously through the capacity check, the username normalization, the `for` loop that checks every existing entry, the `malloc()` for the new entry, and the insertion into the array. The mutex is only unlocked on early-exit error paths or at the very end of a successful insertion. Because the check and the insertion happen within the exact same critical section without yielding, it is genuinely atomic.
+
 ---
 
 ## 11. Known Limitations

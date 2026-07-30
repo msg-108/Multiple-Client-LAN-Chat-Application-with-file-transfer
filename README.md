@@ -13,6 +13,8 @@ A multithreaded TCP client-server chat application written in standard C (C11, P
 - **Non-Blocking Broadcasting**: Local socket array snapshotting under mutex lock so slow/dead clients do not block other active connections.
 - **File Transfer Routing**: Server routes `FILE_START`, `FILE_CHUNK`, and `FILE_END` packets directly from sender to target client without storing files on disk.
 - **Binary File Safety**: File chunking operates strictly in binary mode (`"rb"` / `"wb"`) using `read_file_chunk()` and `write_file_chunk()` without string manipulation functions.
+- **Strict C11 Atomics**: Utilizes `<stdatomic.h>` and `atomic_int` for strictly standard-compliant, lock-free thread state signaling.
+- **Standardized Integer Formatting**: Uses `<inttypes.h>` and `PRId64` macros for strictly portable 64-bit integer (`int64_t`) printing across different architectures.
 - **Progress Indicators**: Displays in-place (`\r`) percentage and byte count progress updates during file upload and download.
 - **Robust Error Handling**:
   - Handles target file not found before sending `FILE_START`.

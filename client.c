@@ -7,6 +7,8 @@
 #include <sys/socket.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <inttypes.h>
+#include <stdatomic.h>
 #include "protocol.h"
 #include "utils.h"
 
@@ -21,7 +23,7 @@
 #define MAX_PAYLOAD_USER_EVENT  (MAX_USERNAME * 2)
 
 // State flag to signal thread shutdown
-static volatile int is_running = 1;
+static atomic_int is_running = 1;
 
 // Global active file reception handle & progress tracker for receiver thread
 static FILE *active_recv_fp = NULL;
@@ -101,8 +103,8 @@ int send_file_to_user(int sock_fd, const char *sender_name, const char *target_n
     strncpy(meta.filename, basename, MAX_FILENAME - 1);
     meta.file_size = file_size;
 
-    printf("[CLIENT] Initiating file transfer: '%s' -> '%s' (File: %s, %ld bytes)...\n",
-           sender_name, target_name, basename, (long)file_size);
+    printf("[CLIENT] Initiating file transfer: '%s' -> '%s' (File: %s, %" PRId64 " bytes)...\n",
+           sender_name, target_name, basename, file_size);
 
     if (send_packet(sock_fd, FILE_START, &meta, (int32_t)sizeof(FileStartPayload)) < 0) {
         perror("[CLIENT ERROR] Failed to send FILE_START packet");
@@ -126,8 +128,8 @@ int send_file_to_user(int sock_fd, const char *sender_name, const char *target_n
         total_bytes_sent += bytes_read;
 
         int percent = (file_size > 0) ? (int)((total_bytes_sent * 100) / file_size) : 100;
-        printf("\r[SEND PROGRESS] Sending '%s': %d%% (%ld/%ld bytes)",
-               basename, percent, (long)total_bytes_sent, (long)file_size);
+        printf("\r[SEND PROGRESS] Sending '%s': %d%% (%" PRId64 "/%" PRId64 " bytes)",
+               basename, percent, total_bytes_sent, file_size);
         fflush(stdout);
     }
 
@@ -140,8 +142,8 @@ int send_file_to_user(int sock_fd, const char *sender_name, const char *target_n
         return -1;
     }
 
-    printf("[CLIENT] File transfer complete: '%s' (%ld bytes) sent successfully to '%s'!\n",
-           basename, (long)total_bytes_sent, target_name);
+    printf("[CLIENT] File transfer complete: '%s' (%" PRId64 " bytes) sent successfully to '%s'!\n",
+           basename, total_bytes_sent, target_name);
     return 0;
 }
 
@@ -229,8 +231,8 @@ void *receive_handler_thread(void *arg) {
                     active_recv_total_size = meta->file_size;
                     active_recv_current_bytes = 0;
 
-                    printf("Receiving %s from %s (%ld bytes)...\n",
-                           meta->filename, meta->sender_username, (long)meta->file_size);
+                    printf("Receiving %s from %s (%" PRId64 " bytes)...\n",
+                           meta->filename, meta->sender_username, meta->file_size);
                     fflush(stdout);
 
                     active_recv_fp = fopen(meta->filename, "wb");
@@ -247,8 +249,8 @@ void *receive_handler_thread(void *arg) {
                     } else {
                         active_recv_current_bytes += header.length;
                         int percent = (active_recv_total_size > 0) ? (int)((active_recv_current_bytes * 100) / active_recv_total_size) : 100;
-                        printf("\r[RECV PROGRESS] Receiving '%s': %d%% (%ld/%ld bytes)",
-                               active_recv_filename, percent, (long)active_recv_current_bytes, (long)active_recv_total_size);
+                        printf("\r[RECV PROGRESS] Receiving '%s': %d%% (%" PRId64 "/%" PRId64 " bytes)",
+                               active_recv_filename, percent, active_recv_current_bytes, active_recv_total_size);
                         fflush(stdout);
                     }
                 }
@@ -262,11 +264,11 @@ void *receive_handler_thread(void *arg) {
                     // 3. Connection interrupted mid-transfer (incomplete file cleanup)
                     if (active_recv_total_size > 0 && active_recv_current_bytes < active_recv_total_size) {
                         remove(active_recv_filename); // Remove incomplete corrupt file
-                        printf("\n[CLIENT ERROR] File transfer of '%s' from '%s' was interrupted prematurely (%ld/%ld bytes received). Incomplete file removed.\n",
-                               active_recv_filename, active_recv_sender, (long)active_recv_current_bytes, (long)active_recv_total_size);
+                        printf("\n[CLIENT ERROR] File transfer of '%s' from '%s' was interrupted prematurely (%" PRId64 "/%" PRId64 " bytes received). Incomplete file removed.\n",
+                               active_recv_filename, active_recv_sender, active_recv_current_bytes, active_recv_total_size);
                     } else {
-                        printf("\nFile transfer complete for '%s' from '%s' (%ld bytes)!\n",
-                               active_recv_filename, active_recv_sender, (long)active_recv_current_bytes);
+                        printf("\nFile transfer complete for '%s' from '%s' (%" PRId64 " bytes)!\n",
+                               active_recv_filename, active_recv_sender, active_recv_current_bytes);
                     }
                     fflush(stdout);
                 }

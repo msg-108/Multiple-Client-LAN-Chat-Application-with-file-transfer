@@ -88,7 +88,7 @@ The goal of testing is to verify that:
 ### TC-07: Disconnect Mid-Transfer & Partial File Cleanup
 - **Inputs**: `Alice` starts transferring `large_8mb.bin` to `Bob` and is terminated (`kill -9`) at 40% completion.
 - **Expected Result**: Server detects disconnect, sends cleanup signal to `Bob`. `Bob` closes file pointer, deletes incomplete file using `remove()`, and logs error notice.
-- **Actual Result**: `Bob` terminal printed `[CLIENT ERROR] File transfer of 'large_8mb.bin' from 'Alice' was interrupted prematurely (33554432/8388608 bytes received). Incomplete file removed.` Partial file was verified deleted from disk.
+- **Actual Result**: `Bob` terminal printed `[CLIENT ERROR] File transfer of 'large_8mb.bin' from 'Alice' was interrupted prematurely (3355443/8388608 bytes received). Incomplete file removed.` Partial file was verified deleted from disk.
 - **Status**: **PASS**
 
 ---
