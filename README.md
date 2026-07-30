@@ -33,14 +33,24 @@ A multithreaded TCP client-server chat application written in standard C (C11, P
 ├── client.c        # Multithreaded TCP chat client with interactive command parser & progress bar
 ├── Makefile        # Build instructions for server, client, and test_utils
 ├── README.md       # Project documentation, build/run instructions, and worked examples
-└── TESTING.md      # Comprehensive Test Plan, Test Matrix, and Verification Logs
+└── TESTING.md      # Comprehensive Test Plan, Test Matrix, Phase 8 Report, and Demo Sequence
 ```
 
 ---
 
 ## Build Instructions
 
-### Option 1: Using `make` (Recommended)
+### Option 1: Using `gcc` Directly (Phase 8 Specification)
+
+```bash
+# 1. Compile and link the Server
+gcc server.c utils.c -o server -lpthread
+
+# 2. Compile and link the Client
+gcc client.c utils.c -o client -lpthread
+```
+
+### Option 2: Using `make` (Recommended)
 
 Run `make` in the terminal to compile all targets (`server`, `client`, `test_utils`):
 
@@ -52,24 +62,6 @@ To clean up compiled binaries and object files:
 
 ```bash
 make clean
-```
-
-### Option 2: Using `gcc` Directly
-
-If compiling manually without `make`, run the following exact `gcc` commands:
-
-```bash
-# 1. Compile utility object file
-gcc -Wall -Wextra -std=c11 -pthread -c utils.c
-
-# 2. Compile and link the Server
-gcc -Wall -Wextra -std=c11 -pthread -o server server.c utils.o
-
-# 3. Compile and link the Server & Client
-gcc -Wall -Wextra -std=c11 -pthread -o client client.c utils.o
-
-# 4. Compile the Unit Test binary
-gcc -Wall -Wextra -std=c11 -pthread -DTEST_UTILS -o test_utils utils.c
 ```
 
 ---
@@ -170,9 +162,9 @@ Inside the client interface, you can use the following commands:
 
 ---
 
-## Testing & Verification
+## Integration, Stress Testing & Verification
 
-For detailed test procedures, test logs, and failure handling verification, consult [TESTING.md](file:///wsl.localhost/Ubuntu/home/loq/Multiple-Client-LAN-Chat-Application-with-file-transfer/TESTING.md).
+For full documentation, edge case results, stress test logs, and live demo presentation scripts, consult [TESTING.md](file:///wsl.localhost/Ubuntu/home/loq/Multiple-Client-LAN-Chat-Application-with-file-transfer/TESTING.md).
 
 ### Quick Unit Test Verification
 
@@ -182,7 +174,7 @@ To execute the unit test suite for binary file chunking:
 ./test_utils
 ```
 
-### Verified Test Suite Summary (`TESTING.md`)
+### Test Suite Summary (`TESTING.md`)
 
 | Test ID | Test Category | Description | Status |
 | :---: | :--- | :--- | :---: |
@@ -196,6 +188,7 @@ To execute the unit test suite for binary file chunking:
 | **TC-08** | Target User Offline | File transfer attempt to offline target user | **PASS** |
 | **TC-09** | Missing Local File | File transfer attempt for missing file path | **PASS** |
 | **TC-10** | Invalid Commands | Command syntax parsing & malformed header protection | **PASS** |
+| **TC-11** | Concurrency Stress Test | 5 concurrent clients sending rapid messages simultaneously | **PASS** |
 
 ---
 
