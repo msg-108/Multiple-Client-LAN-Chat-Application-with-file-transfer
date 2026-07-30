@@ -6,16 +6,97 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include "protocol.h"
 
 #define PORT        8080
 #define BACKLOG     10
 #define BUFFER_SIZE 1024
 
-// Structure used to safely pass client context (socket + address) to worker thread
+/**
+ * Structure representing a connected client entry in the global list
+ */
 typedef struct {
-    int client_fd;
+    int socket_fd;
+    char username[MAX_USERNAME];
     struct sockaddr_in client_addr;
-} client_info_t;
+} client_entry_t;
+
+// Global connected clients list, current count, and protecting mutex
+static client_entry_t *clients[MAX_CLIENTS] = { NULL };
+static int client_count = 0;
+static pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/**
+ * Adds a client to the global client list under mutex protection.
+ * 
+ * @param client_fd Socket file descriptor of connected client.
+ * @param addr Address structure of client.
+ * @param username Initial placeholder username string.
+ * @return Pointer to allocated client_entry_t on success, NULL if server is full.
+ */
+client_entry_t *add_client(int client_fd, struct sockaddr_in addr, const char *username) {
+    pthread_mutex_lock(&clients_mutex);
+
+    // Constraint Check: Do not exceed MAX_CLIENTS
+    if (client_count >= MAX_CLIENTS) {
+        pthread_mutex_unlock(&clients_mutex);
+        return NULL; // Server full
+    }
+
+    client_entry_t *entry = malloc(sizeof(client_entry_t));
+    if (!entry) {
+        pthread_mutex_unlock(&clients_mutex);
+        return NULL;
+    }
+
+    entry->socket_fd = client_fd;
+    entry->client_addr = addr;
+    strncpy(entry->username, username, MAX_USERNAME - 1);
+    entry->username[MAX_USERNAME - 1] = '\0';
+
+    // Find available slot in global array
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i] == NULL) {
+            clients[i] = entry;
+            client_count++;
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&clients_mutex);
+    return entry;
+}
+
+/**
+ * Removes a client from the global client list by socket file descriptor.
+ * Protected by clients_mutex.
+ * 
+ * @param client_fd Socket descriptor of client to remove.
+ */
+void remove_client(int client_fd) {
+    pthread_mutex_lock(&clients_mutex);
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i] != NULL && clients[i]->socket_fd == client_fd) {
+            free(clients[i]);
+            clients[i] = NULL;
+            client_count--;
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&clients_mutex);
+}
+
+/**
+ * Returns current count of connected clients (thread-safe).
+ */
+int get_client_count(void) {
+    pthread_mutex_lock(&clients_mutex);
+    int count = client_count;
+    pthread_mutex_unlock(&clients_mutex);
+    return count;
+}
 
 /**
  * Step 1: Create a TCP Socket
@@ -69,112 +150,124 @@ int start_listening(int server_fd, int backlog) {
 
 /**
  * Worker Thread Handler for Each Connected Client
- * 
- * Thread Lifecycle Explanation:
- * 1. Detach Thread: Calls pthread_detach(pthread_self()) so POSIX/kernel automatically
- *    reclaims thread stack and resources when execution finishes (prevents memory leaks).
- * 2. Unpack Arguments: Extracts client_fd and client_addr from heap pointer and frees heap memory.
- * 3. Receive Loop: Continuously calls recv() to handle messages from this client until disconnect.
- * 4. Cleanup & Termination: Closes client_fd upon client disconnect (recv returns 0) or error (recv returns -1), then exits.
  */
 void *client_handler_thread(void *arg) {
-    // 1. Detach thread for automatic resource reclamation upon completion
     pthread_detach(pthread_self());
 
-    // 2. Unpack heap-allocated client info struct and free memory
-    client_info_t *info = (client_info_t *)arg;
-    if (!info) {
+    client_entry_t *entry = (client_entry_t *)arg;
+    if (!entry) {
         return NULL;
     }
 
-    int client_fd = info->client_fd;
-    struct sockaddr_in client_addr = info->client_addr;
-    free(info); // Free memory allocated in main thread
+    int client_fd = entry->socket_fd;
+    struct sockaddr_in client_addr = entry->client_addr;
 
-    // Extract client IP address string and port number
     char client_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, sizeof(client_ip));
     int client_port = ntohs(client_addr.sin_port);
 
-    printf("[Worker Thread %lu] [+] Client connected: %s:%d (Socket FD: %d)\n",
-           (unsigned long)pthread_self(), client_ip, client_port, client_fd);
+    printf("[Worker Thread %lu] [+] Client '%s' connected: %s:%d (FD: %d) [Connected: %d/%d]\n",
+           (unsigned long)pthread_self(), entry->username, client_ip, client_port, client_fd,
+           get_client_count(), MAX_CLIENTS);
 
     char buffer[BUFFER_SIZE];
     ssize_t bytes_received;
 
-    // 3. Communication Loop: Read messages sent by client using recv()
+    // Receive loop: Handles messages sent by client
     while ((bytes_received = recv(client_fd, buffer, BUFFER_SIZE - 1, 0)) > 0) {
-        buffer[bytes_received] = '\0'; // Null-terminate received string
+        buffer[bytes_received] = '\0'; // Null-terminate string
 
-        printf("[%s:%d | Thread %lu]: %s",
-               client_ip, client_port, (unsigned long)pthread_self(), buffer);
+        printf("[%s (%s:%d) | Thread %lu]: %s",
+               entry->username, client_ip, client_port, (unsigned long)pthread_self(), buffer);
         if (buffer[bytes_received - 1] != '\n') {
             printf("\n");
         }
     }
 
-    // 4. Handle client disconnection or socket error
+    // Handle client disconnect or connection error
     if (bytes_received == 0) {
-        printf("[-] Client %s:%d disconnected (recv returned 0).\n", client_ip, client_port);
+        printf("[-] Client '%s' (%s:%d) disconnected (recv returned 0).\n",
+               entry->username, client_ip, client_port);
     } else {
         perror("[-] recv error");
-        printf("[-] Connection lost with client %s:%d.\n", client_ip, client_port);
+        printf("[-] Connection lost with client '%s' (%s:%d).\n",
+               entry->username, client_ip, client_port);
     }
 
-    // Close client socket descriptor cleanly
+    // Save username copy before freeing entry in remove_client
+    char username_copy[MAX_USERNAME];
+    strncpy(username_copy, entry->username, MAX_USERNAME - 1);
+    username_copy[MAX_USERNAME - 1] = '\0';
+
+    // Thread Safety: Remove client from global list under mutex protection
+    remove_client(client_fd);
     close(client_fd);
-    printf("[Worker Thread %lu] Closed socket FD %d & exiting thread for %s:%d.\n\n",
-           (unsigned long)pthread_self(), client_fd, client_ip, client_port);
+
+    printf("[Worker Thread %lu] Removed '%s' & closed FD %d. Remaining connected clients: %d/%d.\n\n",
+           (unsigned long)pthread_self(), username_copy, client_fd, get_client_count(), MAX_CLIENTS);
 
     return NULL;
 }
 
 /**
  * Step 4: Multithreaded Accept Loop
- * 
- * Main thread accepts incoming connections and immediately spawns a dedicated worker thread
- * via pthread_create() for each client. The main thread continues accepting new clients.
  */
 void accept_clients_loop(int server_fd) {
     printf("=====================================================\n");
     printf("  Multithreaded TCP Server listening on port %d...\n", PORT);
+    printf("  Max Clients Capacity: %d (Protected by pthread_mutex)\n", MAX_CLIENTS);
     printf("  Waiting for incoming client connections...\n");
     printf("=====================================================\n\n");
 
     while (1) {
-        // Allocate heap memory for client info to prevent race conditions on stack variables
-        client_info_t *info = malloc(sizeof(client_info_t));
-        if (!info) {
-            perror("Failed to allocate memory for client info");
-            continue;
-        }
-
+        struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(struct sockaddr_in);
 
-        // Accept client connection (blocks until client connects)
-        info->client_fd = accept(server_fd, (struct sockaddr *)&info->client_addr, &client_len);
-        if (info->client_fd < 0) {
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        if (client_fd < 0) {
             perror("Accept failed");
-            free(info);
             continue;
         }
 
-        printf("[Main Thread] Accepted client socket FD %d. Spawning worker thread...\n", info->client_fd);
+        char client_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, sizeof(client_ip));
+        int client_port = ntohs(client_addr.sin_port);
 
-        // Spawn a dedicated POSIX thread using pthread_create()
+        // Generate placeholder username for new client
+        char placeholder_name[MAX_USERNAME];
+        snprintf(placeholder_name, sizeof(placeholder_name), "Guest_%d", client_fd);
+
+        // Thread Safety: Attempt to add client to global list under mutex protection
+        client_entry_t *entry = add_client(client_fd, client_addr, placeholder_name);
+        if (entry == NULL) {
+            // Requirement: Reject connection with clear message before closing socket if capacity full
+            const char *reject_msg = "SERVER REJECTION: Maximum client limit (100) reached. Connection closed.\n";
+            send(client_fd, reject_msg, strlen(reject_msg), 0);
+
+            printf("[REJECTED] Client %s:%d (FD: %d) rejected - Server full (%d/%d clients).\n",
+                   client_ip, client_port, client_fd, MAX_CLIENTS, MAX_CLIENTS);
+
+            close(client_fd);
+            continue;
+        }
+
+        printf("[Main Thread] Accepted client '%s' from %s:%d (FD: %d). Spawning worker thread...\n",
+               entry->username, client_ip, client_port, client_fd);
+
+        // Spawn a dedicated POSIX thread for this client
         pthread_t tid;
-        int rc = pthread_create(&tid, NULL, client_handler_thread, info);
+        int rc = pthread_create(&tid, NULL, client_handler_thread, entry);
         if (rc != 0) {
             fprintf(stderr, "Failed to create thread: %s\n", strerror(rc));
-            close(info->client_fd);
-            free(info);
+            remove_client(client_fd);
+            close(client_fd);
             continue;
         }
     }
 }
 
 int main(void) {
-    // Disable stdout and stderr buffering so log messages print instantly
+    // Unbuffer stdout and stderr for instant terminal logs
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
 
@@ -199,9 +292,11 @@ int main(void) {
     }
     printf("[Step 3] Multithreaded server listening with backlog queue of %d\n\n", BACKLOG);
 
-    // 4. Accept clients concurrently using POSIX pthreads
+    // 4. Accept clients concurrently
     accept_clients_loop(server_fd);
 
+    // Clean up mutex on shutdown (unreachable infinite loop)
+    pthread_mutex_destroy(&clients_mutex);
     close(server_fd);
     return 0;
 }
