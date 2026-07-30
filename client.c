@@ -137,7 +137,6 @@ void *receive_handler_thread(void *arg) {
                 }
                 break;
             }
-            // Do NOT null-terminate payload if raw binary FILE_CHUNK
             payload[header.length] = '\0';
         }
 
@@ -355,35 +354,74 @@ int main(int argc, char *argv[]) {
     printf("==================================================\n");
     printf("  Structured Protocol Chat & File Transfer Client\n");
     printf("  Logged in as: %s\n", username);
-    printf("  Chat: Type message and press ENTER\n");
-    printf("  Send File: Type /sendfile <target_user> <filepath>\n");
-    printf("  Quit: Type /quit or /exit\n");
+    printf("  Commands:\n");
+    printf("    /msg <message>              - Send chat message\n");
+    printf("    /file <username> <filename> - Transfer file\n");
+    printf("    /quit                       - Exit application\n");
     printf("==================================================\n\n");
 
     char input_buffer[BUFFER_SIZE];
     while (is_running && fgets(input_buffer, sizeof(input_buffer), stdin) != NULL) {
-        if (strncmp(input_buffer, "/quit", 5) == 0 || strncmp(input_buffer, "/exit", 5) == 0) {
-            printf("Sending USER_LEAVE packet and disconnecting...\n");
-            send_packet(sock_fd, USER_LEAVE, username, (int32_t)strlen(username));
-            break;
+        // Strip trailing newline / carriage return
+        size_t len = strlen(input_buffer);
+        while (len > 0 && (input_buffer[len - 1] == '\n' || input_buffer[len - 1] == '\r')) {
+            input_buffer[--len] = '\0';
         }
+        if (len == 0) continue;
 
-        if (strncmp(input_buffer, "/sendfile", 9) == 0) {
-            char cmd[32], target_user[MAX_USERNAME], filepath[256];
-            if (sscanf(input_buffer, "%s %s %s", cmd, target_user, filepath) == 3) {
-                send_file_to_user(sock_fd, username, target_user, filepath);
-            } else {
-                printf("Usage: /sendfile <target_user> <filepath>\n");
+        // Constraint: Parse input before deciding what to send
+        if (input_buffer[0] == '/') {
+            if (strcmp(input_buffer, "/quit") == 0 || strcmp(input_buffer, "/exit") == 0) {
+                printf("[CLIENT] Sending USER_LEAVE packet and disconnecting...\n");
+                send_packet(sock_fd, USER_LEAVE, username, (int32_t)strlen(username));
+                break;
             }
-            continue;
+            else if (strncmp(input_buffer, "/msg", 4) == 0 && (input_buffer[4] == ' ' || input_buffer[4] == '\0')) {
+                const char *msg_content = input_buffer + 4;
+                while (*msg_content == ' ') msg_content++;
+
+                if (strlen(msg_content) == 0) {
+                    printf("[CLIENT] Usage: /msg <message>\n");
+                } else {
+                    char formatted_msg[BUFFER_SIZE + MAX_USERNAME + 16];
+                    snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s\n", username, msg_content);
+                    if (send_packet(sock_fd, CHAT, formatted_msg, (int32_t)strlen(formatted_msg)) < 0) {
+                        perror("[-] Send packet failed");
+                        break;
+                    }
+                }
+            }
+            else if ((strncmp(input_buffer, "/file", 5) == 0 && (input_buffer[5] == ' ' || input_buffer[5] == '\0')) ||
+                     (strncmp(input_buffer, "/sendfile", 9) == 0 && (input_buffer[9] == ' ' || input_buffer[9] == '\0'))) {
+                char cmd[32] = {0};
+                char target_user[MAX_USERNAME] = {0};
+                char filepath[256] = {0};
+
+                int count = sscanf(input_buffer, "%s %s %255s", cmd, target_user, filepath);
+                if (count == 3 && strlen(target_user) > 0 && strlen(filepath) > 0) {
+                    send_file_to_user(sock_fd, username, target_user, filepath);
+                } else {
+                    printf("[CLIENT] Usage: /file <username> <filename>\n");
+                }
+            }
+            else {
+                // Constraint: Report invalid commands rather than crashing or sending garbage to server
+                printf("[CLIENT] Unknown command: '%s'\n", input_buffer);
+                printf("[CLIENT] Available commands:\n");
+                printf("  /msg <message>              - Send chat message\n");
+                printf("  /file <username> <filename> - Transfer file\n");
+                printf("  /quit                       - Disconnect gracefully\n");
+            }
         }
+        else {
+            // Plain text entry: Send as CHAT packet
+            char formatted_msg[BUFFER_SIZE + MAX_USERNAME + 16];
+            snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s\n", username, input_buffer);
 
-        char formatted_msg[BUFFER_SIZE + MAX_USERNAME + 16];
-        snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s", username, input_buffer);
-
-        if (send_packet(sock_fd, CHAT, formatted_msg, (int32_t)strlen(formatted_msg)) < 0) {
-            perror("[-] Send packet failed");
-            break;
+            if (send_packet(sock_fd, CHAT, formatted_msg, (int32_t)strlen(formatted_msg)) < 0) {
+                perror("[-] Send packet failed");
+                break;
+            }
         }
     }
 

@@ -1,0 +1,9 @@
+[Step 1] Socket created successfully (FD: 3)
+[Step 2] Bound successfully to port 8080
+[Step 3] Server listening with backlog queue of 10
+
+=====================================================
+  Structured TCP Server with File Routing listening on port 8080...
+  Routing FILE_START, FILE_CHUNK & FILE_END packets verbatim
+=====================================================
+
