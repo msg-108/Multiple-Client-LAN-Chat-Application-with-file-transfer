@@ -162,6 +162,32 @@ Inside the client interface, you can use the following commands:
 
 ---
 
+## Debugging & Architectural Reference
+
+This section details critical network architectural decisions and root-cause fixes implemented in the codebase:
+
+### 1. Partial or Cut-Off Messages
+- **Root Cause**: Assuming a single `recv()` call returns all requested payload bytes. TCP streams do not preserve packet boundaries.
+- **Implementation Fix**: All socket reads call `recv_all(sock, buf, len)` (`utils.c`), which loops until all `len` bytes are received or returns `-1` immediately on disconnection (`n <= 0`).
+
+### 2. Server Crash on Client Disconnect
+- **Root Cause**: Closing a disconnected socket without updating the global client registry under mutex lock causes subsequent broadcast calls to `send()` to a dead socket descriptor.
+- **Implementation Fix**: `remove_client(client_fd)` removes the entry from the global `clients[]` list under `clients_mutex` lock before socket closure and thread termination.
+
+### 3. File Corruption Safeguards
+- **Root Cause**: Opening files in text mode (`"r"`/`"w"`), applying string functions (`strcpy`, `strlen`, `printf("%s")`) to raw binary chunk buffers, or assuming `CHUNK_SIZE` instead of trusting `Header.length`.
+- **Implementation Fix**: All file I/O uses binary mode (`"rb"` / `"wb"`), raw memory operations (`write_file_chunk`), and trusts `Header.length` for every chunk without string function calls.
+
+### 4. Duplicate Username Race Conditions
+- **Root Cause**: Performing the username existence check and adding the new client in separate mutex-locked blocks creates race conditions where two clients registering simultaneously with identical names can both pass.
+- **Implementation Fix**: `add_client()` performs both the duplicate check iteration and slot assignment inside the **same** `clients_mutex` critical section.
+
+### 5. Server Freezing / Deadlocks Under Load
+- **Root Cause**: Holding `clients_mutex` while executing blocking network `send()` calls during message broadcasting.
+- **Implementation Fix**: `broadcast_packet()` copies destination socket descriptors into a local snapshot array under `clients_mutex`, releases `clients_mutex`, and executes `send_all()` outside the lock.
+
+---
+
 ## Integration, Stress Testing & Verification
 
 For full documentation, edge case results, stress test logs, and live demo presentation scripts, consult [TESTING.md](file:///wsl.localhost/Ubuntu/home/loq/Multiple-Client-LAN-Chat-Application-with-file-transfer/TESTING.md).
