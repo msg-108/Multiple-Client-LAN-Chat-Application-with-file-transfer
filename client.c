@@ -17,6 +17,10 @@
 // State flag to signal thread shutdown
 static volatile int is_running = 1;
 
+// Global active file reception handle for receiver thread
+static FILE *active_recv_fp = NULL;
+static char active_recv_filename[MAX_FILENAME + 32] = {0};
+
 /**
  * Sends a structured message (Header + Payload) using send_all().
  */
@@ -25,12 +29,10 @@ int send_packet(int sock_fd, int32_t type, const void *payload, int32_t payload_
     header.type = type;
     header.length = payload_len;
 
-    // Send Header using send_all()
     if (send_all(sock_fd, &header, (int)sizeof(Header)) < 0) {
         return -1;
     }
 
-    // Send Payload using send_all()
     if (payload_len > 0 && payload != NULL) {
         if (send_all(sock_fd, (void *)payload, payload_len) < 0) {
             return -1;
@@ -41,16 +43,77 @@ int send_packet(int sock_fd, int32_t type, const void *payload, int32_t payload_
 }
 
 /**
+ * Sends a file from client to target user using FILE_START, FILE_CHUNK, and FILE_END packets.
+ */
+int send_file_to_user(int sock_fd, const char *sender_name, const char *target_name, const char *filepath) {
+    FILE *fp = fopen(filepath, "rb"); // Binary read mode
+    if (!fp) {
+        perror("[-] Failed to open local file for reading");
+        return -1;
+    }
+
+    // Extract basename from filepath
+    const char *basename = strrchr(filepath, '/');
+    if (!basename) basename = strrchr(filepath, '\\');
+    basename = (basename) ? (basename + 1) : filepath;
+
+    // 1. Send FILE_START packet with FileStartPayload
+    FileStartPayload meta;
+    memset(&meta, 0, sizeof(meta));
+    strncpy(meta.sender_username, sender_name, MAX_USERNAME - 1);
+    strncpy(meta.target_username, target_name, MAX_USERNAME - 1);
+    strncpy(meta.filename, basename, MAX_FILENAME - 1);
+
+    printf("[FILE] Initiating file transfer: '%s' -> '%s' (File: %s)...\n",
+           sender_name, target_name, basename);
+
+    if (send_packet(sock_fd, FILE_START, &meta, (int32_t)sizeof(FileStartPayload)) < 0) {
+        perror("[-] Failed to send FILE_START packet");
+        fclose(fp);
+        return -1;
+    }
+
+    // 2. Stream FILE_CHUNK packets using read_file_chunk and send_all()
+    char chunk_buffer[CHUNK_SIZE];
+    int bytes_read = 0;
+    int total_bytes_sent = 0;
+
+    while ((bytes_read = read_file_chunk(fp, chunk_buffer, CHUNK_SIZE)) > 0) {
+        Header chunk_header = { .type = FILE_CHUNK, .length = bytes_read };
+        if (send_all(sock_fd, &chunk_header, (int)sizeof(Header)) < 0 ||
+            send_all(sock_fd, chunk_buffer, bytes_read) < 0) {
+            perror("[-] Error sending FILE_CHUNK packet");
+            fclose(fp);
+            return -1;
+        }
+        total_bytes_sent += bytes_read;
+    }
+
+    fclose(fp);
+
+    // 3. Send FILE_END packet (Header.length == 0)
+    Header end_header = { .type = FILE_END, .length = 0 };
+    if (send_all(sock_fd, &end_header, (int)sizeof(Header)) < 0) {
+        perror("[-] Failed to send FILE_END packet");
+        return -1;
+    }
+
+    printf("[FILE] File '%s' (%d bytes) sent successfully to '%s'!\n",
+           basename, total_bytes_sent, target_name);
+    return 0;
+}
+
+/**
  * Receiver Worker Thread Routine
  * 
- * Uses recv_all() for all Header and Payload I/O.
+ * Handles incoming chat, user status, and routed binary file transfers.
  */
 void *receive_handler_thread(void *arg) {
     int sock_fd = (int)(intptr_t)arg;
     Header header;
 
     while (is_running) {
-        // Read Header (8 bytes) using recv_all()
+        // Read Header using recv_all()
         int h_res = recv_all(sock_fd, &header, (int)sizeof(Header));
         if (h_res < 0) {
             if (is_running) {
@@ -60,7 +123,7 @@ void *receive_handler_thread(void *arg) {
             break;
         }
 
-        // Read Payload trusting header.length using recv_all()
+        // Read Payload using recv_all() trusting header.length
         char *payload = NULL;
         if (header.length > 0) {
             payload = malloc((size_t)header.length + 1);
@@ -74,10 +137,11 @@ void *receive_handler_thread(void *arg) {
                 }
                 break;
             }
+            // Do NOT null-terminate payload if raw binary FILE_CHUNK
             payload[header.length] = '\0';
         }
 
-        // Display incoming message types
+        // Handle incoming packet types
         switch (header.type) {
             case CHAT:
                 printf("%s", payload ? payload : "");
@@ -97,6 +161,38 @@ void *receive_handler_thread(void *arg) {
                 fflush(stdout);
                 break;
 
+            case FILE_START:
+                if (header.length >= (int32_t)sizeof(FileStartPayload) && payload != NULL) {
+                    FileStartPayload *meta = (FileStartPayload *)payload;
+                    snprintf(active_recv_filename, sizeof(active_recv_filename), "received_%s", meta->filename);
+
+                    active_recv_fp = fopen(active_recv_filename, "wb"); // Binary write mode
+                    if (!active_recv_fp) {
+                        perror("[-] Failed to open output file for received file");
+                    } else {
+                        printf("\n[FILE] Incoming file transfer: '%s' from '%s'. Saving as '%s'...\n",
+                               meta->filename, meta->sender_username, active_recv_filename);
+                        fflush(stdout);
+                    }
+                }
+                break;
+
+            case FILE_CHUNK:
+                if (active_recv_fp != NULL && payload != NULL && header.length > 0) {
+                    // Write raw binary payload chunk to file using write_file_chunk()
+                    write_file_chunk(active_recv_fp, payload, header.length);
+                }
+                break;
+
+            case FILE_END:
+                if (active_recv_fp != NULL) {
+                    fclose(active_recv_fp);
+                    active_recv_fp = NULL;
+                    printf("[FILE] Transfer complete! Saved file as '%s'\n\n", active_recv_filename);
+                    fflush(stdout);
+                }
+                break;
+
             default:
                 if (payload) printf("%s\n", payload);
                 fflush(stdout);
@@ -104,6 +200,11 @@ void *receive_handler_thread(void *arg) {
         }
 
         if (payload) free(payload);
+    }
+
+    if (active_recv_fp != NULL) {
+        fclose(active_recv_fp);
+        active_recv_fp = NULL;
     }
 
     return NULL;
@@ -159,13 +260,11 @@ int main(int argc, char *argv[]) {
 
     printf("Connecting to server at %s:%d...\n", server_ip, port);
 
-    // 1. Create socket
     int sock_fd = create_client_socket();
     if (sock_fd < 0) {
         exit(EXIT_FAILURE);
     }
 
-    // 2. Connect to server
     if (connect_to_server(sock_fd, server_ip, port) < 0) {
         close(sock_fd);
         exit(EXIT_FAILURE);
@@ -173,7 +272,6 @@ int main(int argc, char *argv[]) {
 
     printf("Connected to server at %s:%d!\n\n", server_ip, port);
 
-    // 3. Username Registration Loop
     char username[MAX_USERNAME] = {0};
     int registered = 0;
 
@@ -202,17 +300,15 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // Send USER_JOIN registration packet via send_all()
         if (send_packet(sock_fd, USER_JOIN, username, (int32_t)strlen(username)) < 0) {
             perror("[-] Error sending username registration packet");
             close(sock_fd);
             exit(EXIT_FAILURE);
         }
 
-        // Check for immediate server response
         struct timeval tv;
         tv.tv_sec = 0;
-        tv.tv_usec = 200000; // 200ms
+        tv.tv_usec = 200000;
         setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         Header resp_header;
@@ -237,7 +333,7 @@ int main(int argc, char *argv[]) {
                 if (resp_payload[strlen(resp_payload) - 1] != '\n') printf("\n");
                 free(resp_payload);
 
-                cli_username = NULL; // Force interactive prompt for retry
+                cli_username = NULL;
                 continue;
             }
 
@@ -249,7 +345,6 @@ int main(int argc, char *argv[]) {
 
     printf("[+] Registered successfully as '%s'!\n\n", username);
 
-    // 4. Spawn Receiver Thread using pthreads
     pthread_t recv_thread;
     if (pthread_create(&recv_thread, NULL, receive_handler_thread, (void *)(intptr_t)sock_fd) != 0) {
         perror("Failed to create receiving thread");
@@ -257,12 +352,12 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    // 5. Main Thread Input Loop
     printf("==================================================\n");
-    printf("  Structured Protocol Chat Client\n");
+    printf("  Structured Protocol Chat & File Transfer Client\n");
     printf("  Logged in as: %s\n", username);
-    printf("  Type messages and press ENTER to send.\n");
-    printf("  Type /quit or /exit to disconnect.\n");
+    printf("  Chat: Type message and press ENTER\n");
+    printf("  Send File: Type /sendfile <target_user> <filepath>\n");
+    printf("  Quit: Type /quit or /exit\n");
     printf("==================================================\n\n");
 
     char input_buffer[BUFFER_SIZE];
@@ -273,7 +368,16 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        // Format outgoing chat message as "[username]: message"
+        if (strncmp(input_buffer, "/sendfile", 9) == 0) {
+            char cmd[32], target_user[MAX_USERNAME], filepath[256];
+            if (sscanf(input_buffer, "%s %s %s", cmd, target_user, filepath) == 3) {
+                send_file_to_user(sock_fd, username, target_user, filepath);
+            } else {
+                printf("Usage: /sendfile <target_user> <filepath>\n");
+            }
+            continue;
+        }
+
         char formatted_msg[BUFFER_SIZE + MAX_USERNAME + 16];
         snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s", username, input_buffer);
 

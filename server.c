@@ -35,7 +35,26 @@ static int client_count = 0;
 static pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /**
- * Sends a structured Header + Payload packet using send_all().
+ * Searches global client registry for connected target username under mutex protection.
+ * 
+ * @param target_username Username string to look up.
+ * @return Target socket descriptor if online, or -1 if not found.
+ */
+int find_client_socket_by_username(const char *target_username) {
+    pthread_mutex_lock(&clients_mutex);
+    int target_fd = -1;
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i] != NULL && strcmp(clients[i]->username, target_username) == 0) {
+            target_fd = clients[i]->socket_fd;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+    return target_fd;
+}
+
+/**
+ * Sends structured Header + Payload packet using send_all().
  */
 int send_packet(int fd, int32_t type, const void *payload, int32_t payload_len) {
     Header header = { .type = type, .length = payload_len };
@@ -48,10 +67,6 @@ int send_packet(int fd, int32_t type, const void *payload, int32_t payload_len) 
 
 /**
  * Reads Header from socket using recv_all().
- * 
- * @param fd Socket descriptor.
- * @param header Output Header pointer.
- * @return 1 on success, -1 on disconnect/error.
  */
 int read_header(int fd, Header *header) {
     int res = recv_all(fd, header, (int)sizeof(Header));
@@ -61,11 +76,6 @@ int read_header(int fd, Header *header) {
 
 /**
  * Reads Payload from socket using recv_all().
- * 
- * @param fd Socket descriptor.
- * @param payload_buf Output buffer.
- * @param payload_len Exact payload size.
- * @return 1 on success, -1 on disconnect/error.
  */
 int read_payload(int fd, void *payload_buf, int payload_len) {
     if (payload_len == 0) return 1;
@@ -97,7 +107,6 @@ add_status_t add_client(int client_fd, struct sockaddr_in addr, const char *raw_
         snprintf(clean_name, sizeof(clean_name), "Guest_%d", client_fd);
     }
 
-    // Atomic Duplicate Check under SAME lock
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i] != NULL && strcmp(clients[i]->username, clean_name) == 0) {
             pthread_mutex_unlock(&clients_mutex);
@@ -175,15 +184,11 @@ void broadcast_packet(int sender_fd, Header header, const void *payload) {
 
     for (int i = 0; i < target_count; i++) {
         int dest_fd = target_sockets[i];
-        
-        // Send Header via send_all()
         if (send_all(dest_fd, &header, (int)sizeof(Header)) < 0) {
             remove_client(dest_fd);
             close(dest_fd);
             continue;
         }
-
-        // Send Payload via send_all()
         if (header.length > 0 && payload != NULL) {
             if (send_all(dest_fd, (void *)payload, header.length) < 0) {
                 remove_client(dest_fd);
@@ -201,9 +206,6 @@ void broadcast_user_event(int sender_fd, int32_t type, const char *username) {
     broadcast_packet(sender_fd, header, username);
 }
 
-/**
- * Step 1: Create a TCP Socket
- */
 int create_server_socket(void) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
@@ -221,9 +223,6 @@ int create_server_socket(void) {
     return server_fd;
 }
 
-/**
- * Step 2: Bind Socket to Port 8080
- */
 int bind_server_socket(int server_fd, int port) {
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
@@ -240,9 +239,6 @@ int bind_server_socket(int server_fd, int port) {
     return 0;
 }
 
-/**
- * Step 3: Listen for Incoming Connections
- */
 int start_listening(int server_fd, int backlog) {
     if (listen(server_fd, backlog) < 0) {
         perror("Listen failed");
@@ -252,7 +248,7 @@ int start_listening(int server_fd, int backlog) {
 }
 
 /**
- * Worker Thread Handler for Each Client
+ * Worker Thread Handler supporting Chat and Direct File Transfer Routing.
  */
 void *client_handler_thread(void *arg) {
     pthread_detach(pthread_self());
@@ -266,7 +262,9 @@ void *client_handler_thread(void *arg) {
     inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, sizeof(client_ip));
     int client_port = ntohs(client_addr.sin_port);
 
-    // Read initial Header via recv_all()
+    // Track target socket FD for active file transfer routing
+    int active_file_target_fd = -1;
+
     Header first_header;
     int h_res = read_header(client_fd, &first_header);
     if (h_res <= 0) {
@@ -297,7 +295,6 @@ void *client_handler_thread(void *arg) {
         snprintf(raw_username, sizeof(raw_username), "Guest_%d", client_fd);
     }
 
-    // Add client & duplicate check under mutex
     client_entry_t *entry = NULL;
     add_status_t status = add_client(client_fd, client_addr, raw_username, &entry);
 
@@ -329,11 +326,11 @@ void *client_handler_thread(void *arg) {
 
     Header header;
 
-    // Receive loop for subsequent packets using recv_all()
+    // Receive loop for structured packets using send_all() & recv_all()
     while (1) {
         h_res = read_header(client_fd, &header);
         if (h_res <= 0) {
-            printf("[-] Client '%s' (%s:%d) disconnected cleanly or recv error.\n",
+            printf("[-] Client '%s' (%s:%d) disconnected cleanly or read error.\n",
                    entry->username, client_ip, client_port);
             break;
         }
@@ -348,6 +345,7 @@ void *client_handler_thread(void *arg) {
                 free(payload);
                 break;
             }
+            // Do NOT null terminate or touch payload with string functions if FILE_CHUNK (handled safely below)
             payload[header.length] = '\0';
         }
 
@@ -361,26 +359,77 @@ void *client_handler_thread(void *arg) {
                 break;
             }
 
-            case USER_LEAVE: {
-                printf("[USER_LEAVE] Client '%s' sent leave packet.\n", entry->username);
-                break;
-            }
-
             case FILE_START: {
-                printf("[FILE_START] File metadata from '%s' (%d bytes)\n", entry->username, header.length);
-                broadcast_packet(client_fd, header, payload);
+                if (header.length >= (int32_t)sizeof(FileStartPayload) && payload != NULL) {
+                    FileStartPayload *meta = (FileStartPayload *)payload;
+                    printf("[FILE ROUTER] FILE_START request: File '%s' from '%s' -> Target '%s'\n",
+                           meta->filename, entry->username, meta->target_username);
+
+                    // Behavior 1: Look up target_username in client registry
+                    int target_fd = find_client_socket_by_username(meta->target_username);
+
+                    if (target_fd < 0) {
+                        // Behavior 2: Target not found / not connected. Send error back to sender, do not forward.
+                        char err_msg[BUFFER_SIZE];
+                        snprintf(err_msg, sizeof(err_msg),
+                                 "ERROR: Target user '%s' is not connected. File transfer canceled.\n",
+                                 meta->target_username);
+                        send_packet(client_fd, CHAT, err_msg, (int32_t)strlen(err_msg));
+                        printf("[FILE ROUTER] Target user '%s' not found. Rejection sent to '%s'.\n",
+                               meta->target_username, entry->username);
+                        active_file_target_fd = -1;
+                    } else {
+                        // Behavior 3: Target found. Forward FILE_START packet verbatim using send_all()
+                        active_file_target_fd = target_fd;
+                        if (send_all(target_fd, &header, (int)sizeof(Header)) < 0 ||
+                            send_all(target_fd, payload, header.length) < 0) {
+                            perror("[FILE ROUTER ERROR] Failed to forward FILE_START to target");
+                            active_file_target_fd = -1;
+                        } else {
+                            printf("[FILE ROUTER] Forwarded FILE_START ('%s') to '%s' (FD: %d)\n",
+                                   meta->filename, meta->target_username, target_fd);
+                        }
+                    }
+                }
                 break;
             }
 
             case FILE_CHUNK: {
-                printf("[FILE_CHUNK] Relaying file chunk (%d bytes) from '%s'\n", header.length, entry->username);
-                broadcast_packet(client_fd, header, payload);
+                printf("[FILE ROUTER] Received FILE_CHUNK (%d bytes) from '%s'\n",
+                       header.length, entry->username);
+
+                // Constraint: Trust header.length, handle raw binary payload safely without string functions
+                if (active_file_target_fd > 0 && payload != NULL && header.length > 0) {
+                    // Forward FILE_CHUNK header and raw payload verbatim using send_all()
+                    if (send_all(active_file_target_fd, &header, (int)sizeof(Header)) < 0 ||
+                        send_all(active_file_target_fd, payload, header.length) < 0) {
+                        perror("[FILE ROUTER ERROR] Failed to forward FILE_CHUNK to target");
+                        active_file_target_fd = -1;
+                    } else {
+                        printf("[FILE ROUTER] Forwarded %d bytes binary chunk to target FD %d\n",
+                               header.length, active_file_target_fd);
+                    }
+                }
                 break;
             }
 
             case FILE_END: {
-                printf("[FILE_END] File transfer complete signal from '%s'\n", entry->username);
-                broadcast_packet(client_fd, header, payload);
+                printf("[FILE ROUTER] Received FILE_END signal from '%s'\n", entry->username);
+                if (active_file_target_fd > 0) {
+                    // Forward FILE_END header verbatim using send_all()
+                    if (send_all(active_file_target_fd, &header, (int)sizeof(Header)) < 0) {
+                        perror("[FILE ROUTER ERROR] Failed to forward FILE_END to target");
+                    } else {
+                        printf("[FILE ROUTER] Forwarded FILE_END to target FD %d. Transfer completed!\n",
+                               active_file_target_fd);
+                    }
+                    active_file_target_fd = -1;
+                }
+                break;
+            }
+
+            case USER_LEAVE: {
+                printf("[USER_LEAVE] Client '%s' sent leave packet.\n", entry->username);
                 break;
             }
 
@@ -412,13 +461,10 @@ void *client_handler_thread(void *arg) {
     return NULL;
 }
 
-/**
- * Step 4: Multithreaded Accept Loop
- */
 void accept_clients_loop(int server_fd) {
     printf("=====================================================\n");
-    printf("  Structured TCP Server listening on port %d...\n", PORT);
-    printf("  Using send_all() & recv_all() for all packet I/O\n");
+    printf("  Structured TCP Server with File Routing listening on port %d...\n", PORT);
+    printf("  Routing FILE_START, FILE_CHUNK & FILE_END packets verbatim\n");
     printf("=====================================================\n\n");
 
     while (1) {
@@ -477,7 +523,7 @@ int main(void) {
         close(server_fd);
         exit(EXIT_FAILURE);
     }
-    printf("[Step 3] Multithreaded server listening with backlog queue of %d\n\n", BACKLOG);
+    printf("[Step 3] Server listening with backlog queue of %d\n\n", BACKLOG);
 
     accept_clients_loop(server_fd);
 

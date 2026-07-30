@@ -1,0 +1,7 @@
+Connecting to server at 127.0.0.1:8080...
+Connected to server at 127.0.0.1:8080!
+
+
+[REJECTED] ERROR: Username 'Init' is already taken. Connection rejected.
+Enter your username (max 31 chars): 
+No username entered. Exiting.
