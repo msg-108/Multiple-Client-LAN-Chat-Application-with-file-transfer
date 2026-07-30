@@ -12,3 +12,7 @@ Connected to server at 127.0.0.1:8080!
     /quit                       - Exit application
 ==================================================
 
+[+] ErrUser joined the chat
+[-] ErrUser left the chat
+[+] TestUser joined the chat
+[-] TestUser left the chat

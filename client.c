@@ -14,6 +14,12 @@
 #define DEFAULT_PORT 8080
 #define BUFFER_SIZE  1024
 
+// Robustness payload limits client-side
+#define MAX_PAYLOAD_CHAT        4096
+#define MAX_PAYLOAD_FILE_CHUNK  (CHUNK_SIZE * 64) // 64 KB limit
+#define MAX_PAYLOAD_FILE_START  (int32_t)(sizeof(FileStartPayload) + 128)
+#define MAX_PAYLOAD_USER_EVENT  (MAX_USERNAME * 2)
+
 // State flag to signal thread shutdown
 static volatile int is_running = 1;
 
@@ -23,6 +29,28 @@ static char active_recv_filename[MAX_FILENAME + 32] = {0};
 static char active_recv_sender[MAX_USERNAME] = {0};
 static int64_t active_recv_total_size = 0;
 static int64_t active_recv_current_bytes = 0;
+
+/**
+ * Validates payload size limits for incoming packet types to prevent memory errors or segfaults.
+ */
+int is_client_payload_valid(int32_t type, int32_t length) {
+    if (length < 0) return 0;
+    switch (type) {
+        case CHAT:
+            return length <= MAX_PAYLOAD_CHAT;
+        case USER_JOIN:
+        case USER_LEAVE:
+            return length <= MAX_PAYLOAD_USER_EVENT;
+        case FILE_START:
+            return length <= MAX_PAYLOAD_FILE_START;
+        case FILE_CHUNK:
+            return length <= MAX_PAYLOAD_FILE_CHUNK;
+        case FILE_END:
+            return length == 0;
+        default:
+            return length <= MAX_PAYLOAD_CHAT;
+    }
+}
 
 /**
  * Sends a structured message (Header + Payload) using send_all().
@@ -47,12 +75,6 @@ int send_packet(int sock_fd, int32_t type, const void *payload, int32_t payload_
 
 /**
  * Sends a file from client to target user with in-place (\r) progress indicator.
- * 
- * @param sock_fd Socket file descriptor.
- * @param sender_name Username of sender.
- * @param target_name Username of destination target user.
- * @param filepath Local path to file.
- * @return 0 on success, -1 on failure.
  */
 int send_file_to_user(int sock_fd, const char *sender_name, const char *target_name, const char *filepath) {
     FILE *fp = fopen(filepath, "rb");
@@ -71,7 +93,6 @@ int send_file_to_user(int sock_fd, const char *sender_name, const char *target_n
     if (!basename) basename = strrchr(filepath, '\\');
     basename = (basename) ? (basename + 1) : filepath;
 
-    // Construct FileStartPayload with total file_size
     FileStartPayload meta;
     memset(&meta, 0, sizeof(meta));
     strncpy(meta.sender_username, sender_name, MAX_USERNAME - 1);
@@ -92,7 +113,6 @@ int send_file_to_user(int sock_fd, const char *sender_name, const char *target_n
     int bytes_read = 0;
     int64_t total_bytes_sent = 0;
 
-    // Read and transmit binary chunks with in-place (\r) progress indicator
     while ((bytes_read = read_file_chunk(fp, chunk_buffer, CHUNK_SIZE)) > 0) {
         Header chunk_header = { .type = FILE_CHUNK, .length = bytes_read };
         if (send_all(sock_fd, &chunk_header, (int)sizeof(Header)) < 0 ||
@@ -109,7 +129,7 @@ int send_file_to_user(int sock_fd, const char *sender_name, const char *target_n
         fflush(stdout);
     }
 
-    printf("\n"); // Newline after in-place progress updates
+    printf("\n");
     fclose(fp);
 
     Header end_header = { .type = FILE_END, .length = 0 };
@@ -124,31 +144,51 @@ int send_file_to_user(int sock_fd, const char *sender_name, const char *target_n
 }
 
 /**
- * Receiver Worker Thread Routine with in-place (\r) progress indicator.
+ * Receiver Worker Thread Routine with Comprehensive Error Handling.
  */
 void *receive_handler_thread(void *arg) {
     int sock_fd = (int)(intptr_t)arg;
     Header header;
 
     while (is_running) {
+        // Read Header (8 bytes) using recv_all()
         int h_res = recv_all(sock_fd, &header, (int)sizeof(Header));
         if (h_res < 0) {
             if (is_running) {
-                printf("\n[-] Server disconnected or read error.\n");
+                // Requirement 1: Server unexpectedly closing connection detection
+                printf("\n[CLIENT ERROR] Server unexpectedly closed the connection.\n");
                 is_running = 0;
             }
             break;
         }
 
+        // Requirement 2: Malformed / unexpected message length validation
+        if (!is_client_payload_valid(header.type, header.length)) {
+            printf("\n[CLIENT WARNING] Malformed packet received from server (type: %d, length: %d). Ignoring packet.\n",
+                   header.type, header.length);
+            if (header.length > 0 && header.length < 1048576) {
+                char *discard = malloc((size_t)header.length);
+                if (discard) {
+                    recv_all(sock_fd, discard, header.length);
+                    free(discard);
+                }
+            }
+            continue;
+        }
+
+        // Read Payload safely
         char *payload = NULL;
         if (header.length > 0) {
             payload = malloc((size_t)header.length + 1);
-            if (!payload) break;
+            if (!payload) {
+                printf("\n[CLIENT ERROR] Memory allocation failed for incoming payload (%d bytes).\n", header.length);
+                break;
+            }
 
             if (recv_all(sock_fd, payload, header.length) < 0) {
                 free(payload);
                 if (is_running) {
-                    printf("\n[-] Error reading payload from server.\n");
+                    printf("\n[CLIENT ERROR] Server disconnected while reading payload.\n");
                     is_running = 0;
                 }
                 break;
@@ -156,6 +196,7 @@ void *receive_handler_thread(void *arg) {
             payload[header.length] = '\0';
         }
 
+        // Requirement 2: Malformed/unexpected message type handling
         switch (header.type) {
             case CHAT:
                 printf("%s", payload ? payload : "");
@@ -203,7 +244,7 @@ void *receive_handler_thread(void *arg) {
             case FILE_CHUNK:
                 if (active_recv_fp != NULL && payload != NULL && header.length > 0) {
                     if (write_file_chunk(active_recv_fp, payload, header.length) != 0) {
-                        fprintf(stderr, "\n[CLIENT ERROR] Failed to write file chunk!\n");
+                        fprintf(stderr, "\n[CLIENT ERROR] Failed to write file chunk to disk!\n");
                     } else {
                         active_recv_current_bytes += header.length;
                         int percent = (active_recv_total_size > 0) ? (int)((active_recv_current_bytes * 100) / active_recv_total_size) : 100;
@@ -224,7 +265,9 @@ void *receive_handler_thread(void *arg) {
                 break;
 
             default:
-                if (payload) printf("%s\n", payload);
+                // Requirement 2: Unexpected message type handling without crashing
+                printf("\n[CLIENT WARNING] Malformed or unknown message type %d (%d bytes) received from server. Ignored.\n",
+                       header.type, header.length);
                 fflush(stdout);
                 break;
         }
@@ -246,7 +289,7 @@ void *receive_handler_thread(void *arg) {
 int create_client_socket(void) {
     int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (sock_fd < 0) {
-        perror("Socket creation error");
+        perror("[CLIENT ERROR] Socket creation error");
         return -1;
     }
     return sock_fd;
@@ -260,12 +303,12 @@ int connect_to_server(int sock_fd, const char *ip, int port) {
     server_addr.sin_port = htons(port);
 
     if (inet_pton(AF_INET, ip, &server_addr.sin_addr) <= 0) {
-        perror("Invalid or unsupported IP address format");
+        perror("[CLIENT ERROR] Invalid or unsupported IP address format");
         return -1;
     }
 
     if (connect(sock_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Connection to server failed");
+        perror("[CLIENT ERROR] Connection to server failed");
         return -1;
     }
 
@@ -334,7 +377,7 @@ int main(int argc, char *argv[]) {
         }
 
         if (send_packet(sock_fd, USER_JOIN, username, (int32_t)strlen(username)) < 0) {
-            perror("[-] Error sending username registration packet");
+            perror("[CLIENT ERROR] Error sending username registration packet");
             close(sock_fd);
             exit(EXIT_FAILURE);
         }
@@ -380,7 +423,7 @@ int main(int argc, char *argv[]) {
 
     pthread_t recv_thread;
     if (pthread_create(&recv_thread, NULL, receive_handler_thread, (void *)(intptr_t)sock_fd) != 0) {
-        perror("Failed to create receiving thread");
+        perror("[CLIENT ERROR] Failed to create receiving thread");
         close(sock_fd);
         exit(EXIT_FAILURE);
     }
@@ -402,6 +445,7 @@ int main(int argc, char *argv[]) {
         }
         if (len == 0) continue;
 
+        // Requirement 3: Parse input before deciding what to send & handle invalid input
         if (input_buffer[0] == '/') {
             if (strcmp(input_buffer, "/quit") == 0 || strcmp(input_buffer, "/exit") == 0) {
                 printf("[CLIENT] Sending USER_LEAVE packet and disconnecting...\n");
@@ -413,12 +457,12 @@ int main(int argc, char *argv[]) {
                 while (*msg_content == ' ') msg_content++;
 
                 if (strlen(msg_content) == 0) {
-                    printf("[CLIENT] Usage: /msg <message>\n");
+                    printf("[CLIENT ERROR] Invalid command input. Usage: /msg <message>\n");
                 } else {
                     char formatted_msg[BUFFER_SIZE + MAX_USERNAME + 16];
                     snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s\n", username, msg_content);
                     if (send_packet(sock_fd, CHAT, formatted_msg, (int32_t)strlen(formatted_msg)) < 0) {
-                        perror("[-] Send packet failed");
+                        perror("[CLIENT ERROR] Send packet failed");
                         break;
                     }
                 }
@@ -433,12 +477,12 @@ int main(int argc, char *argv[]) {
                 if (count == 3 && strlen(target_user) > 0 && strlen(filepath) > 0) {
                     send_file_to_user(sock_fd, username, target_user, filepath);
                 } else {
-                    printf("[CLIENT] Usage: /file <username> <filename>\n");
+                    printf("[CLIENT ERROR] Invalid command input. Usage: /file <username> <filename>\n");
                 }
             }
             else {
-                printf("[CLIENT] Unknown command: '%s'\n", input_buffer);
-                printf("[CLIENT] Available commands:\n");
+                printf("[CLIENT ERROR] Invalid command input: '%s'\n", input_buffer);
+                printf("Available commands:\n");
                 printf("  /msg <message>              - Send chat message\n");
                 printf("  /file <username> <filename> - Transfer file\n");
                 printf("  /quit                       - Disconnect gracefully\n");
@@ -449,16 +493,17 @@ int main(int argc, char *argv[]) {
             snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s\n", username, input_buffer);
 
             if (send_packet(sock_fd, CHAT, formatted_msg, (int32_t)strlen(formatted_msg)) < 0) {
-                perror("[-] Send packet failed");
+                perror("[CLIENT ERROR] Send packet failed");
                 break;
             }
         }
     }
 
+    // Requirement 4: Ensure client prints a clear message and exits cleanly
     is_running = 0;
     close(sock_fd);
     pthread_join(recv_thread, NULL);
 
-    printf("Connection closed gracefully.\n");
+    printf("[CLIENT] Connection closed gracefully. Goodbye!\n");
     return 0;
 }
