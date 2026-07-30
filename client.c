@@ -56,7 +56,6 @@ ssize_t write_exact(int fd, const void *buf, size_t len) {
 
 /**
  * Sends a structured message (Header + Payload) to server.
- * Requirement: Send Header -> Payload, always.
  */
 int send_packet(int sock_fd, int32_t type, const void *payload, int32_t payload_len) {
     Header header;
@@ -79,14 +78,14 @@ int send_packet(int sock_fd, int32_t type, const void *payload, int32_t payload_
 /**
  * Receiver Worker Thread Routine
  * 
- * Handles incoming broadcast packets (CHAT, USER_JOIN, USER_LEAVE).
+ * Requirement: Display incoming messages as: "[username]: message"
  */
 void *receive_handler_thread(void *arg) {
     int sock_fd = (int)(intptr_t)arg;
     Header header;
 
     while (is_running) {
-        // Read Header
+        // Read Header (8 bytes)
         ssize_t h_res = read_exact(sock_fd, &header, sizeof(Header));
         if (h_res <= 0) {
             if (is_running) {
@@ -100,7 +99,7 @@ void *receive_handler_thread(void *arg) {
             break;
         }
 
-        // Read Payload trusting header.length
+        // Read Payload (trusting header.length)
         char *payload = NULL;
         if (header.length > 0) {
             payload = malloc((size_t)header.length + 1);
@@ -117,9 +116,10 @@ void *receive_handler_thread(void *arg) {
             payload[header.length] = '\0';
         }
 
-        // Handle message type
+        // Display incoming message types
         switch (header.type) {
             case CHAT:
+                // Requirement: Display incoming messages as: "[username]: message"
                 printf("%s", payload ? payload : "");
                 if (payload && header.length > 0 && payload[header.length - 1] != '\n') {
                     printf("\n");
@@ -203,17 +203,15 @@ int main(int argc, char *argv[]) {
 
     printf("Connected to server at %s:%d!\n\n", server_ip, port);
 
-    // Requirement 1 & 3: Interactive / Retry Username Registration Loop
+    // 3. Username Registration Loop
     char username[MAX_USERNAME] = {0};
     int registered = 0;
 
     while (!registered) {
         if (cli_username != NULL) {
-            // Constraint: Limit username to 32 (MAX_USERNAME) chars client-side
             strncpy(username, cli_username, MAX_USERNAME - 1);
             username[MAX_USERNAME - 1] = '\0';
         } else {
-            // Requirement 1: Ask user to enter a username at startup
             printf("Enter your username (max %d chars): ", MAX_USERNAME - 1);
             if (fgets(username, sizeof(username), stdin) == NULL) {
                 printf("\nNo username entered. Exiting.\n");
@@ -221,7 +219,6 @@ int main(int argc, char *argv[]) {
                 exit(EXIT_SUCCESS);
             }
 
-            // Strip trailing newlines
             size_t len = strlen(username);
             while (len > 0 && (username[len - 1] == '\n' || username[len - 1] == '\r')) {
                 username[--len] = '\0';
@@ -233,15 +230,14 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // Requirement 2: Send username to server immediately using Header + payload format
+        // Send USER_JOIN registration packet
         if (send_packet(sock_fd, USER_JOIN, username, (int32_t)strlen(username)) < 0) {
             perror("[-] Error sending username packet");
             close(sock_fd);
             exit(EXIT_FAILURE);
         }
 
-        // Check for immediate server rejection packet (e.g. duplicate username or server full)
-        // Set short socket timeout to check for immediate response
+        // Check for immediate server response
         struct timeval tv;
         tv.tv_sec = 0;
         tv.tv_usec = 200000; // 200ms
@@ -250,13 +246,11 @@ int main(int argc, char *argv[]) {
         Header resp_header;
         ssize_t h_res = read_exact(sock_fd, &resp_header, sizeof(Header));
 
-        // Reset socket timeout back to non-blocking/blocking default
         tv.tv_sec = 0;
         tv.tv_usec = 0;
         setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         if (h_res == (ssize_t)sizeof(Header)) {
-            // Server sent a response packet!
             char *resp_payload = NULL;
             if (resp_header.length > 0) {
                 resp_payload = malloc((size_t)resp_header.length + 1);
@@ -266,28 +260,22 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            if (resp_payload && (strstr(resp_payload, "ERROR:") || strstr(resp_payload, "already taken") || strstr(resp_payload, "REJECTION"))) {
-                // Requirement 3: Print clear rejection message and retry with a different name
+            if (resp_payload && (strstr(resp_payload, "ERROR:") || strstr(resp_payload, "already taken"))) {
                 printf("\n[REJECTED] %s\n", resp_payload);
                 free(resp_payload);
-
-                if (cli_username != NULL) {
-                    // Reset cli_username to force interactive prompt for retry
-                    cli_username = NULL;
-                }
-                continue; // Retry loop!
+                cli_username = NULL;
+                continue;
             }
 
             if (resp_payload) free(resp_payload);
         }
 
-        // Registration accepted!
         registered = 1;
     }
 
     printf("[+] Registered successfully as '%s'!\n\n", username);
 
-    // 4. Spawn Receiver Thread using pthreads for ongoing chat messages
+    // 4. Spawn Receiver Thread using pthreads
     pthread_t recv_thread;
     if (pthread_create(&recv_thread, NULL, receive_handler_thread, (void *)(intptr_t)sock_fd) != 0) {
         perror("Failed to create receiving thread");
@@ -296,10 +284,13 @@ int main(int argc, char *argv[]) {
     }
 
     // 5. Main Thread Input Loop
+    // Requirement: Format outgoing chat payload so server & clients identify sender and content
     if (cli_message != NULL) {
-        printf("Sending CHAT packet: %s\n", cli_message);
-        send_packet(sock_fd, CHAT, cli_message, (int32_t)strlen(cli_message));
-        usleep(300000); // 300ms pause to process broadcast replies
+        char formatted_msg[BUFFER_SIZE + MAX_USERNAME + 16];
+        snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s", username, cli_message);
+        printf("Sending CHAT packet: %s\n", formatted_msg);
+        send_packet(sock_fd, CHAT, formatted_msg, (int32_t)strlen(formatted_msg));
+        usleep(300000);
     } else {
         printf("==================================================\n");
         printf("  Structured Protocol Chat Client\n");
@@ -316,7 +307,11 @@ int main(int argc, char *argv[]) {
                 break;
             }
 
-            if (send_packet(sock_fd, CHAT, input_buffer, (int32_t)strlen(input_buffer)) < 0) {
+            // Requirement: Format outgoing chat payload as "[username]: message"
+            char formatted_msg[BUFFER_SIZE + MAX_USERNAME + 16];
+            snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s", username, input_buffer);
+
+            if (send_packet(sock_fd, CHAT, formatted_msg, (int32_t)strlen(formatted_msg)) < 0) {
                 perror("[-] Send packet failed");
                 break;
             }
