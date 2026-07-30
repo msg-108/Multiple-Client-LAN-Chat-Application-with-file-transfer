@@ -1,0 +1,14 @@
+[Step 1] Socket created successfully (FD: 3)
+[Step 2] Bound successfully to port 8080
+[Step 3] Multithreaded server listening with backlog queue of 10
+
+=====================================================
+  Structured TCP Server listening on port 8080...
+  Protocol: Header (8B) + Payload | Max Clients: 100
+  Waiting for incoming client connections...
+=====================================================
+
+[Main Thread] Accepted client 'Guest_4' from 127.0.0.1:52860 (FD: 4). Spawning worker thread...
+[Worker Thread 132035486152384] [+] Client 'Guest_4' connected: 127.0.0.1:52860 (FD: 4) [Connected: 1/100]
+[USER_JOIN] Client on FD 4 registered username: 'User_8272'
+[CHAT | User_8272 (127.0.0.1:52860)]: Bob

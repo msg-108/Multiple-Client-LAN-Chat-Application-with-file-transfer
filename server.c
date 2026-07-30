@@ -12,7 +12,9 @@
 #define BACKLOG     10
 #define BUFFER_SIZE 1024
 
-// Structure representing a connected client entry in the global list
+/**
+ * Structure representing a connected client entry in the global list
+ */
 typedef struct {
     int socket_fd;
     char username[MAX_USERNAME];
@@ -25,20 +27,107 @@ static int client_count = 0;
 static pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /**
- * Adds a client to the global client list under mutex protection.
+ * Helper: Reads EXACTLY `len` bytes from socket file descriptor.
+ * Naive recv() may return fewer bytes than requested; this loops until all `len` bytes
+ * are received or until connection closes/errors.
  * 
- * @param client_fd Socket file descriptor of connected client.
- * @param addr Address structure of client.
- * @param username Initial placeholder username string.
- * @return Pointer to allocated client_entry_t on success, NULL if server is full.
+ * @param fd Socket file descriptor.
+ * @param buf Output buffer pointer.
+ * @param len Exact number of bytes to receive.
+ * @return Number of bytes read (len on success, 0 on EOF, -1 on error).
+ */
+ssize_t read_exact(int fd, void *buf, size_t len) {
+    size_t total_read = 0;
+    char *ptr = (char *)buf;
+
+    while (total_read < len) {
+        ssize_t bytes_read = recv(fd, ptr + total_read, len - total_read, 0);
+        if (bytes_read > 0) {
+            total_read += bytes_read;
+        } else if (bytes_read == 0) {
+            // EOF: Client disconnected
+            return (total_read == 0) ? 0 : -1;
+        } else {
+            perror("read_exact error");
+            return -1;
+        }
+    }
+
+    return (ssize_t)total_read;
+}
+
+/**
+ * Helper: Writes EXACTLY `len` bytes to socket file descriptor.
+ * 
+ * @param fd Socket file descriptor.
+ * @param buf Input buffer pointer.
+ * @param len Exact number of bytes to send.
+ * @return Number of bytes written (len on success, -1 on error).
+ */
+ssize_t write_exact(int fd, const void *buf, size_t len) {
+    size_t total_written = 0;
+    const char *ptr = (const char *)buf;
+
+    while (total_written < len) {
+        ssize_t bytes_written = send(fd, ptr + total_written, len - total_written, MSG_NOSIGNAL);
+        if (bytes_written > 0) {
+            total_written += bytes_written;
+        } else {
+            perror("write_exact error");
+            return -1;
+        }
+    }
+
+    return (ssize_t)total_written;
+}
+
+/**
+ * Helper: Reads a complete Header struct (sizeof(Header) = 8 bytes) from socket.
+ * 
+ * @param fd Socket descriptor.
+ * @param header Pointer to Header output struct.
+ * @return 1 on success, 0 on client disconnect, -1 on error.
+ */
+int read_header(int fd, Header *header) {
+    ssize_t res = read_exact(fd, header, sizeof(Header));
+    if (res == (ssize_t)sizeof(Header)) {
+        return 1;
+    } else if (res == 0) {
+        return 0; // Clean disconnect
+    } else {
+        return -1; // Read error
+    }
+}
+
+/**
+ * Helper: Reads exactly payload_len bytes (Header.length) from socket.
+ * 
+ * @param fd Socket descriptor.
+ * @param payload_buf Pointer to destination buffer.
+ * @param payload_len Exact number of bytes to read.
+ * @return 1 on success, -1 on error.
+ */
+int read_payload(int fd, void *payload_buf, size_t payload_len) {
+    if (payload_len == 0) {
+        return 1; // Empty payload (e.g. FILE_END)
+    }
+
+    ssize_t res = read_exact(fd, payload_buf, payload_len);
+    if (res == (ssize_t)payload_len) {
+        return 1;
+    }
+    return -1;
+}
+
+/**
+ * Adds a client to the global client list under mutex protection.
  */
 client_entry_t *add_client(int client_fd, struct sockaddr_in addr, const char *username) {
     pthread_mutex_lock(&clients_mutex);
 
-    // Constraint Check: Do not exceed MAX_CLIENTS
     if (client_count >= MAX_CLIENTS) {
         pthread_mutex_unlock(&clients_mutex);
-        return NULL; // Server full
+        return NULL;
     }
 
     client_entry_t *entry = malloc(sizeof(client_entry_t));
@@ -52,7 +141,6 @@ client_entry_t *add_client(int client_fd, struct sockaddr_in addr, const char *u
     strncpy(entry->username, username, MAX_USERNAME - 1);
     entry->username[MAX_USERNAME - 1] = '\0';
 
-    // Find available slot in global array
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i] == NULL) {
             clients[i] = entry;
@@ -67,9 +155,6 @@ client_entry_t *add_client(int client_fd, struct sockaddr_in addr, const char *u
 
 /**
  * Removes a client from the global client list by socket file descriptor.
- * Protected by clients_mutex.
- * 
- * @param client_fd Socket descriptor of client to remove.
  */
 void remove_client(int client_fd) {
     pthread_mutex_lock(&clients_mutex);
@@ -97,57 +182,51 @@ int get_client_count(void) {
 }
 
 /**
- * Broadcasts a message from sender to all other connected clients.
+ * Broadcasts a structured packet (Header + Payload) to all connected clients except sender.
  * 
- * Constraint Enforcement:
- * 1. Lock clients_mutex ONLY to copy target socket descriptors into local array.
- * 2. Release clients_mutex BEFORE invoking send() on any socket.
- * 3. Safely handle failed send() by removing disconnected target clients without crashing.
+ * Locks mutex ONLY to copy target socket descriptors, then releases mutex BEFORE write_exact().
  * 
- * @param sender_fd Socket descriptor of client sending the message.
- * @param sender_username Username string of sender.
- * @param message Message content buffer.
+ * @param sender_fd Socket descriptor of sending client.
+ * @param header Structured Header to send.
+ * @param payload Payload memory pointer.
  */
-void broadcast_message(int sender_fd, const char *sender_username, const char *message) {
+void broadcast_packet(int sender_fd, Header header, const void *payload) {
     int target_sockets[MAX_CLIENTS];
     int target_count = 0;
 
-    // 1. Lock mutex ONLY long enough to snapshot target client socket descriptors
     pthread_mutex_lock(&clients_mutex);
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i] != NULL && clients[i]->socket_fd != sender_fd) {
             target_sockets[target_count++] = clients[i]->socket_fd;
         }
     }
-    // RELEASE mutex before sending data!
     pthread_mutex_unlock(&clients_mutex);
 
     if (target_count == 0) {
-        return; // No other clients connected
+        return;
     }
 
-    // Format broadcast payload string
-    char formatted_msg[BUFFER_SIZE + MAX_USERNAME + 16];
-    snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s", sender_username, message);
-    size_t msg_len = strlen(formatted_msg);
+    printf("[BROADCAST] Relaying Packet (Type: %d, Length: %d bytes) to %d recipient(s)...\n",
+           header.type, header.length, target_count);
 
-    printf("[BROADCAST] Relaying message from '%s' (FD: %d) to %d recipient(s)...\n",
-           sender_username, sender_fd, target_count);
-
-    // 2. Perform send() calls OUTSIDE the mutex lock
     for (int i = 0; i < target_count; i++) {
         int dest_fd = target_sockets[i];
 
-        // Send message to target client (MSG_NOSIGNAL prevents SIGPIPE crash if client disconnected)
-        ssize_t bytes_sent = send(dest_fd, formatted_msg, msg_len, MSG_NOSIGNAL);
-
-        if (bytes_sent < 0) {
-            // Handle send failure safely: remove broken socket and close connection
-            perror("[BROADCAST ERROR] send() failed for destination socket");
-            printf("[BROADCAST ERROR] Removing unresponsive client (FD: %d)\n", dest_fd);
-
+        // Send Header (8 bytes)
+        if (write_exact(dest_fd, &header, sizeof(Header)) < 0) {
+            printf("[BROADCAST ERROR] Failed to send Header to FD %d. Removing client.\n", dest_fd);
             remove_client(dest_fd);
             close(dest_fd);
+            continue;
+        }
+
+        // Send Payload if length > 0
+        if (header.length > 0 && payload != NULL) {
+            if (write_exact(dest_fd, payload, header.length) < 0) {
+                printf("[BROADCAST ERROR] Failed to send Payload to FD %d. Removing client.\n", dest_fd);
+                remove_client(dest_fd);
+                close(dest_fd);
+            }
         }
     }
 }
@@ -204,6 +283,11 @@ int start_listening(int server_fd, int backlog) {
 
 /**
  * Worker Thread Handler for Each Connected Client
+ * 
+ * Requirement:
+ * - Always receive Header first, then exactly Header.length bytes of payload
+ * - Process messages using switch(header.type)
+ * - Trust Header.length for payload memory allocation
  */
 void *client_handler_thread(void *arg) {
     pthread_detach(pthread_self());
@@ -224,39 +308,121 @@ void *client_handler_thread(void *arg) {
            (unsigned long)pthread_self(), entry->username, client_ip, client_port, client_fd,
            get_client_count(), MAX_CLIENTS);
 
-    char buffer[BUFFER_SIZE];
-    ssize_t bytes_received;
+    Header header;
 
-    // Receive loop: Handles messages sent by client
-    while ((bytes_received = recv(client_fd, buffer, BUFFER_SIZE - 1, 0)) > 0) {
-        buffer[bytes_received] = '\0'; // Null-terminate string
-
-        printf("[%s (%s:%d) | Thread %lu]: %s",
-               entry->username, client_ip, client_port, (unsigned long)pthread_self(), buffer);
-        if (buffer[bytes_received - 1] != '\n') {
-            printf("\n");
+    // Loop: Receive Header first, then exact payload
+    while (1) {
+        // Step A: Read Header
+        int h_res = read_header(client_fd, &header);
+        if (h_res <= 0) {
+            if (h_res == 0) {
+                printf("[-] Client '%s' (%s:%d) disconnected cleanly.\n",
+                       entry->username, client_ip, client_port);
+            } else {
+                printf("[-] Error reading header from client '%s' (%s:%d).\n",
+                       entry->username, client_ip, client_port);
+            }
+            break;
         }
 
-        // Broadcast message to all other connected clients
-        broadcast_message(client_fd, entry->username, buffer);
+        // Step B: Read Payload (trusting header.length)
+        char *payload = NULL;
+        if (header.length > 0) {
+            payload = malloc((size_t)header.length + 1);
+            if (!payload) {
+                fprintf(stderr, "Memory allocation failed for payload length %d\n", header.length);
+                break;
+            }
+
+            if (read_payload(client_fd, payload, (size_t)header.length) < 0) {
+                printf("[-] Error reading payload (%d bytes) from client '%s'.\n",
+                       header.length, entry->username);
+                free(payload);
+                break;
+            }
+            payload[header.length] = '\0'; // Safe null-termination
+        }
+
+        // Step C: Process messages using switch(header.type)
+        switch (header.type) {
+            case CHAT: {
+                printf("[CHAT | %s (%s:%d)]: %s",
+                       entry->username, client_ip, client_port, payload ? payload : "");
+                if (payload && header.length > 0 && payload[header.length - 1] != '\n') {
+                    printf("\n");
+                }
+
+                // Broadcast CHAT message to other clients
+                broadcast_packet(client_fd, header, payload);
+                break;
+            }
+
+            case USER_JOIN: {
+                if (payload && header.length > 0) {
+                    pthread_mutex_lock(&clients_mutex);
+                    strncpy(entry->username, payload, MAX_USERNAME - 1);
+                    entry->username[MAX_USERNAME - 1] = '\0';
+                    pthread_mutex_unlock(&clients_mutex);
+                }
+                printf("[USER_JOIN] Client on FD %d registered username: '%s'\n", client_fd, entry->username);
+                broadcast_packet(client_fd, header, payload);
+                break;
+            }
+
+            case USER_LEAVE: {
+                printf("[USER_LEAVE] Client '%s' (FD: %d) sent leave signal.\n",
+                       entry->username, client_fd);
+                broadcast_packet(client_fd, header, payload);
+                break;
+            }
+
+            case FILE_START: {
+                printf("[FILE_START] Received file metadata from '%s' (%d bytes payload)\n",
+                       entry->username, header.length);
+                if (header.length >= (int32_t)sizeof(FileStartPayload)) {
+                    FileStartPayload *meta = (FileStartPayload *)payload;
+                    printf("             File: '%s' | Sender: '%s' -> Target: '%s'\n",
+                           meta->filename, meta->sender_username, meta->target_username);
+                }
+                broadcast_packet(client_fd, header, payload);
+                break;
+            }
+
+            case FILE_CHUNK: {
+                printf("[FILE_CHUNK] Relaying file chunk (%d bytes) from '%s'\n",
+                       header.length, entry->username);
+                broadcast_packet(client_fd, header, payload);
+                break;
+            }
+
+            case FILE_END: {
+                printf("[FILE_END] Received file transfer complete signal from '%s'\n",
+                       entry->username);
+                broadcast_packet(client_fd, header, payload);
+                break;
+            }
+
+            default: {
+                printf("[UNKNOWN PACKET] Unknown header type %d (length: %d) from '%s'\n",
+                       header.type, header.length, entry->username);
+                break;
+            }
+        }
+
+        if (payload) {
+            free(payload);
+        }
+
+        if (header.type == USER_LEAVE) {
+            break;
+        }
     }
 
-    // Handle client disconnect or connection error
-    if (bytes_received == 0) {
-        printf("[-] Client '%s' (%s:%d) disconnected (recv returned 0).\n",
-               entry->username, client_ip, client_port);
-    } else {
-        perror("[-] recv error");
-        printf("[-] Connection lost with client '%s' (%s:%d).\n",
-               entry->username, client_ip, client_port);
-    }
-
-    // Save username copy before freeing entry in remove_client
+    // Cleanup client entry
     char username_copy[MAX_USERNAME];
     strncpy(username_copy, entry->username, MAX_USERNAME - 1);
     username_copy[MAX_USERNAME - 1] = '\0';
 
-    // Thread Safety: Remove client from global list under mutex protection
     remove_client(client_fd);
     close(client_fd);
 
@@ -271,8 +437,8 @@ void *client_handler_thread(void *arg) {
  */
 void accept_clients_loop(int server_fd) {
     printf("=====================================================\n");
-    printf("  Multithreaded TCP Server listening on port %d...\n", PORT);
-    printf("  Max Clients Capacity: %d (Protected by pthread_mutex)\n", MAX_CLIENTS);
+    printf("  Structured TCP Server listening on port %d...\n", PORT);
+    printf("  Protocol: Header (8B) + Payload | Max Clients: %d\n", MAX_CLIENTS);
     printf("  Waiting for incoming client connections...\n");
     printf("=====================================================\n\n");
 
@@ -290,16 +456,16 @@ void accept_clients_loop(int server_fd) {
         inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, sizeof(client_ip));
         int client_port = ntohs(client_addr.sin_port);
 
-        // Generate placeholder username for new client
         char placeholder_name[MAX_USERNAME];
         snprintf(placeholder_name, sizeof(placeholder_name), "Guest_%d", client_fd);
 
-        // Thread Safety: Attempt to add client to global list under mutex protection
         client_entry_t *entry = add_client(client_fd, client_addr, placeholder_name);
         if (entry == NULL) {
-            // Requirement: Reject connection with clear message before closing socket if capacity full
+            // Rejection Packet
+            Header reject_header = { .type = CHAT, .length = 74 };
             const char *reject_msg = "SERVER REJECTION: Maximum client limit (100) reached. Connection closed.\n";
-            send(client_fd, reject_msg, strlen(reject_msg), 0);
+            write_exact(client_fd, &reject_header, sizeof(Header));
+            write_exact(client_fd, reject_msg, strlen(reject_msg));
 
             printf("[REJECTED] Client %s:%d (FD: %d) rejected - Server full (%d/%d clients).\n",
                    client_ip, client_port, client_fd, MAX_CLIENTS, MAX_CLIENTS);
@@ -311,7 +477,6 @@ void accept_clients_loop(int server_fd) {
         printf("[Main Thread] Accepted client '%s' from %s:%d (FD: %d). Spawning worker thread...\n",
                entry->username, client_ip, client_port, client_fd);
 
-        // Spawn a dedicated POSIX thread for this client
         pthread_t tid;
         int rc = pthread_create(&tid, NULL, client_handler_thread, entry);
         if (rc != 0) {
@@ -324,35 +489,29 @@ void accept_clients_loop(int server_fd) {
 }
 
 int main(void) {
-    // Unbuffer stdout and stderr for instant terminal logs
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
 
-    // 1. Create socket
     int server_fd = create_server_socket();
     if (server_fd < 0) {
         exit(EXIT_FAILURE);
     }
     printf("[Step 1] Socket created successfully (FD: %d)\n", server_fd);
 
-    // 2. Bind to port 8080
     if (bind_server_socket(server_fd, PORT) < 0) {
         close(server_fd);
         exit(EXIT_FAILURE);
     }
     printf("[Step 2] Bound successfully to port %d\n", PORT);
 
-    // 3. Listen for incoming connections
     if (start_listening(server_fd, BACKLOG) < 0) {
         close(server_fd);
         exit(EXIT_FAILURE);
     }
     printf("[Step 3] Multithreaded server listening with backlog queue of %d\n\n", BACKLOG);
 
-    // 4. Accept clients concurrently
     accept_clients_loop(server_fd);
 
-    // Clean up mutex on shutdown (unreachable infinite loop)
     pthread_mutex_destroy(&clients_mutex);
     close(server_fd);
     return 0;
