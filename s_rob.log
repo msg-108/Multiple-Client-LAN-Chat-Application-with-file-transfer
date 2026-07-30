@@ -1,0 +1,12 @@
+[Step 1] Socket created successfully (FD: 3)
+[Step 2] Bound successfully to port 8080
+[Step 3] Server listening with backlog queue of 10
+
+=====================================================
+  Robust Structured TCP Server on port 8080...
+  Features: Fault Isolation, Size Check, Mid-Transfer Cleanup
+=====================================================
+
+[Main Thread] Accepted connection from 127.0.0.1:55402 (FD: 4). Spawning worker thread...
+[Worker Thread 130347985532608] [+] Client 'NormalUser' registered: 127.0.0.1:55402 (FD: 4) [Connected: 1/100]
+[BROADCAST EVENT] 'NormalUser' joined the chat.

@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -12,6 +13,12 @@
 #define PORT        8080
 #define BACKLOG     10
 #define BUFFER_SIZE 1024
+
+// Robustness payload limits
+#define MAX_PAYLOAD_CHAT        4096
+#define MAX_PAYLOAD_FILE_CHUNK  (CHUNK_SIZE * 64) // 64 KB limit
+#define MAX_PAYLOAD_FILE_START  (int32_t)(sizeof(FileStartPayload) + 128)
+#define MAX_PAYLOAD_USER_EVENT  (MAX_USERNAME * 2)
 
 typedef struct {
     int socket_fd;
@@ -35,10 +42,30 @@ static int client_count = 0;
 static pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /**
+ * Validates payload size limits for each message type to prevent memory exhaustion attacks.
+ */
+int is_payload_size_valid(int32_t type, int32_t length) {
+    if (length < 0) return 0;
+
+    switch (type) {
+        case CHAT:
+            return length <= MAX_PAYLOAD_CHAT;
+        case USER_JOIN:
+        case USER_LEAVE:
+            return length <= MAX_PAYLOAD_USER_EVENT;
+        case FILE_START:
+            return length <= MAX_PAYLOAD_FILE_START;
+        case FILE_CHUNK:
+            return length <= MAX_PAYLOAD_FILE_CHUNK;
+        case FILE_END:
+            return length == 0;
+        default:
+            return length <= MAX_PAYLOAD_CHAT;
+    }
+}
+
+/**
  * Searches global client registry for connected target username under mutex protection.
- * 
- * @param target_username Username string to look up.
- * @return Target socket descriptor if online, or -1 if not found.
  */
 int find_client_socket_by_username(const char *target_username) {
     pthread_mutex_lock(&clients_mutex);
@@ -58,9 +85,15 @@ int find_client_socket_by_username(const char *target_username) {
  */
 int send_packet(int fd, int32_t type, const void *payload, int32_t payload_len) {
     Header header = { .type = type, .length = payload_len };
-    if (send_all(fd, &header, (int)sizeof(Header)) < 0) return -1;
+    if (send_all(fd, &header, (int)sizeof(Header)) < 0) {
+        fprintf(stderr, "[SERVER ERROR] Failed to send header to FD %d\n", fd);
+        return -1;
+    }
     if (payload_len > 0 && payload != NULL) {
-        if (send_all(fd, (void *)payload, payload_len) < 0) return -1;
+        if (send_all(fd, (void *)payload, payload_len) < 0) {
+            fprintf(stderr, "[SERVER ERROR] Failed to send payload (%d bytes) to FD %d\n", payload_len, fd);
+            return -1;
+        }
     }
     return 0;
 }
@@ -185,12 +218,14 @@ void broadcast_packet(int sender_fd, Header header, const void *payload) {
     for (int i = 0; i < target_count; i++) {
         int dest_fd = target_sockets[i];
         if (send_all(dest_fd, &header, (int)sizeof(Header)) < 0) {
+            fprintf(stderr, "[SERVER WARNING] Failed to broadcast header to FD %d. Removing client.\n", dest_fd);
             remove_client(dest_fd);
             close(dest_fd);
             continue;
         }
         if (header.length > 0 && payload != NULL) {
             if (send_all(dest_fd, (void *)payload, header.length) < 0) {
+                fprintf(stderr, "[SERVER WARNING] Failed to broadcast payload to FD %d. Removing client.\n", dest_fd);
                 remove_client(dest_fd);
                 close(dest_fd);
             }
@@ -209,13 +244,13 @@ void broadcast_user_event(int sender_fd, int32_t type, const char *username) {
 int create_server_socket(void) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
-        perror("Socket creation failed");
+        perror("[SERVER ERROR] Socket creation failed");
         return -1;
     }
 
     int opt = 1;
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        perror("setsockopt SO_REUSEADDR failed");
+        perror("[SERVER ERROR] setsockopt SO_REUSEADDR failed");
         close(server_fd);
         return -1;
     }
@@ -232,7 +267,7 @@ int bind_server_socket(int server_fd, int port) {
     server_addr.sin_port = htons(port);
 
     if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Bind failed");
+        perror("[SERVER ERROR] Bind failed");
         return -1;
     }
 
@@ -241,14 +276,14 @@ int bind_server_socket(int server_fd, int port) {
 
 int start_listening(int server_fd, int backlog) {
     if (listen(server_fd, backlog) < 0) {
-        perror("Listen failed");
+        perror("[SERVER ERROR] Listen failed");
         return -1;
     }
     return 0;
 }
 
 /**
- * Worker Thread Handler supporting Chat and Direct File Transfer Routing.
+ * Worker Thread Handler with Comprehensive Robustness & Error Logging.
  */
 void *client_handler_thread(void *arg) {
     pthread_detach(pthread_self());
@@ -262,13 +297,21 @@ void *client_handler_thread(void *arg) {
     inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, sizeof(client_ip));
     int client_port = ntohs(client_addr.sin_port);
 
-    // Track target socket FD for active file transfer routing
+    // Track active file transfer target for cleanup if sender disconnects mid-transfer
     int active_file_target_fd = -1;
 
     Header first_header;
     int h_res = read_header(client_fd, &first_header);
     if (h_res <= 0) {
-        printf("[-] Client %s:%d disconnected before registering username.\n", client_ip, client_port);
+        printf("[SERVER WARNING] Client %s:%d disconnected before registering username.\n", client_ip, client_port);
+        close(client_fd);
+        return NULL;
+    }
+
+    // Validate registration payload size
+    if (!is_payload_size_valid(first_header.type, first_header.length)) {
+        fprintf(stderr, "[SERVER ERROR] Oversized payload (%d bytes) in registration packet from %s:%d. Closing.\n",
+                first_header.length, client_ip, client_port);
         close(client_fd);
         return NULL;
     }
@@ -277,7 +320,7 @@ void *client_handler_thread(void *arg) {
     if (first_header.length > 0) {
         int read_len = (first_header.length < (int32_t)(MAX_USERNAME - 1)) ? first_header.length : (int32_t)(MAX_USERNAME - 1);
         if (read_payload(client_fd, raw_username, read_len) < 0) {
-            printf("[-] Error reading username payload from %s:%d\n", client_ip, client_port);
+            fprintf(stderr, "[SERVER ERROR] Error reading username payload from %s:%d\n", client_ip, client_port);
             close(client_fd);
             return NULL;
         }
@@ -326,29 +369,40 @@ void *client_handler_thread(void *arg) {
 
     Header header;
 
-    // Receive loop for structured packets using send_all() & recv_all()
+    // Main packet receive loop with robustness checks
     while (1) {
         h_res = read_header(client_fd, &header);
         if (h_res <= 0) {
-            printf("[-] Client '%s' (%s:%d) disconnected cleanly or read error.\n",
+            printf("[-] Client '%s' (%s:%d) disconnected or read error.\n",
                    entry->username, client_ip, client_port);
+            break;
+        }
+
+        // Robustness 2: Reject oversized payloads without trying to allocate/read them
+        if (!is_payload_size_valid(header.type, header.length)) {
+            fprintf(stderr, "[SERVER ERROR] Rejected oversized payload (%d bytes) for type %d from client '%s'. Closing socket.\n",
+                    header.length, header.type, entry->username);
             break;
         }
 
         char *payload = NULL;
         if (header.length > 0) {
             payload = malloc((size_t)header.length + 1);
-            if (!payload) break;
+            if (!payload) {
+                fprintf(stderr, "[SERVER ERROR] Out of memory allocating %d bytes payload for '%s'. Closing socket.\n",
+                        header.length, entry->username);
+                break;
+            }
 
             if (read_payload(client_fd, payload, header.length) < 0) {
-                printf("[-] Error reading payload (%d bytes) from '%s'.\n", header.length, entry->username);
+                fprintf(stderr, "[SERVER ERROR] Failed reading payload (%d bytes) from '%s'.\n", header.length, entry->username);
                 free(payload);
                 break;
             }
-            // Do NOT null terminate or touch payload with string functions if FILE_CHUNK (handled safely below)
             payload[header.length] = '\0';
         }
 
+        // Robustness 1: Handle invalid message types by logging and ignoring
         switch (header.type) {
             case CHAT: {
                 printf("[%s (%s:%d)]: %s", entry->username, client_ip, client_port, payload ? payload : "");
@@ -365,60 +419,52 @@ void *client_handler_thread(void *arg) {
                     printf("[FILE ROUTER] FILE_START request: File '%s' from '%s' -> Target '%s'\n",
                            meta->filename, entry->username, meta->target_username);
 
-                    // Behavior 1: Look up target_username in client registry
                     int target_fd = find_client_socket_by_username(meta->target_username);
 
                     if (target_fd < 0) {
-                        // Behavior 2: Target not found / not connected. Send error back to sender, do not forward.
                         char err_msg[BUFFER_SIZE];
                         snprintf(err_msg, sizeof(err_msg),
                                  "ERROR: Target user '%s' is not connected. File transfer canceled.\n",
                                  meta->target_username);
                         send_packet(client_fd, CHAT, err_msg, (int32_t)strlen(err_msg));
-                        printf("[FILE ROUTER] Target user '%s' not found. Rejection sent to '%s'.\n",
+                        printf("[FILE ROUTER WARNING] Target user '%s' not connected. Rejection sent to '%s'.\n",
                                meta->target_username, entry->username);
                         active_file_target_fd = -1;
                     } else {
-                        // Behavior 3: Target found. Forward FILE_START packet verbatim using send_all()
                         active_file_target_fd = target_fd;
                         if (send_all(target_fd, &header, (int)sizeof(Header)) < 0 ||
                             send_all(target_fd, payload, header.length) < 0) {
-                            perror("[FILE ROUTER ERROR] Failed to forward FILE_START to target");
+                            fprintf(stderr, "[FILE ROUTER ERROR] Failed to forward FILE_START to target FD %d\n", target_fd);
                             active_file_target_fd = -1;
                         } else {
                             printf("[FILE ROUTER] Forwarded FILE_START ('%s') to '%s' (FD: %d)\n",
                                    meta->filename, meta->target_username, target_fd);
                         }
                     }
+                } else {
+                    fprintf(stderr, "[SERVER WARNING] Invalid FILE_START payload size (%d bytes) from '%s'. Ignored.\n",
+                            header.length, entry->username);
                 }
                 break;
             }
 
             case FILE_CHUNK: {
-                printf("[FILE ROUTER] Received FILE_CHUNK (%d bytes) from '%s'\n",
-                       header.length, entry->username);
-
-                // Constraint: Trust header.length, handle raw binary payload safely without string functions
                 if (active_file_target_fd > 0 && payload != NULL && header.length > 0) {
-                    // Forward FILE_CHUNK header and raw payload verbatim using send_all()
                     if (send_all(active_file_target_fd, &header, (int)sizeof(Header)) < 0 ||
                         send_all(active_file_target_fd, payload, header.length) < 0) {
-                        perror("[FILE ROUTER ERROR] Failed to forward FILE_CHUNK to target");
+                        fprintf(stderr, "[FILE ROUTER ERROR] Target FD %d write failed during FILE_CHUNK. Interrupted.\n",
+                                active_file_target_fd);
                         active_file_target_fd = -1;
-                    } else {
-                        printf("[FILE ROUTER] Forwarded %d bytes binary chunk to target FD %d\n",
-                               header.length, active_file_target_fd);
                     }
                 }
                 break;
             }
 
             case FILE_END: {
-                printf("[FILE ROUTER] Received FILE_END signal from '%s'\n", entry->username);
                 if (active_file_target_fd > 0) {
-                    // Forward FILE_END header verbatim using send_all()
                     if (send_all(active_file_target_fd, &header, (int)sizeof(Header)) < 0) {
-                        perror("[FILE ROUTER ERROR] Failed to forward FILE_END to target");
+                        fprintf(stderr, "[FILE ROUTER ERROR] Target FD %d write failed during FILE_END.\n",
+                                active_file_target_fd);
                     } else {
                         printf("[FILE ROUTER] Forwarded FILE_END to target FD %d. Transfer completed!\n",
                                active_file_target_fd);
@@ -429,12 +475,14 @@ void *client_handler_thread(void *arg) {
             }
 
             case USER_LEAVE: {
-                printf("[USER_LEAVE] Client '%s' sent leave packet.\n", entry->username);
+                printf("[USER_LEAVE] Client '%s' requested disconnect.\n", entry->username);
                 break;
             }
 
             default:
-                printf("[UNKNOWN] Header type %d from '%s'\n", header.type, entry->username);
+                // Robustness 1: Log unknown header types and ignore without crashing
+                printf("[SERVER WARNING] Unknown message type %d (%d bytes payload) received from '%s'. Message ignored.\n",
+                       header.type, header.length, entry->username);
                 break;
         }
 
@@ -445,9 +493,18 @@ void *client_handler_thread(void *arg) {
         }
     }
 
+    // Robustness 3: Handle client disconnect mid file-transfer and clean up server-side state
     char username_copy[MAX_USERNAME];
     strncpy(username_copy, entry->username, MAX_USERNAME - 1);
     username_copy[MAX_USERNAME - 1] = '\0';
+
+    if (active_file_target_fd > 0) {
+        Header end_hdr = { .type = FILE_END, .length = 0 };
+        send_all(active_file_target_fd, &end_hdr, (int)sizeof(Header));
+        printf("[FILE ROUTER WARNING] Sender '%s' disconnected mid-transfer. Sent FILE_END cleanup to target FD %d.\n",
+               username_copy, active_file_target_fd);
+        active_file_target_fd = -1;
+    }
 
     printf("[BROADCAST EVENT] '%s' left the chat.\n", username_copy);
     broadcast_user_event(client_fd, USER_LEAVE, username_copy);
@@ -463,8 +520,8 @@ void *client_handler_thread(void *arg) {
 
 void accept_clients_loop(int server_fd) {
     printf("=====================================================\n");
-    printf("  Structured TCP Server with File Routing listening on port %d...\n", PORT);
-    printf("  Routing FILE_START, FILE_CHUNK & FILE_END packets verbatim\n");
+    printf("  Robust Structured TCP Server on port %d...\n", PORT);
+    printf("  Features: Fault Isolation, Size Check, Mid-Transfer Cleanup\n");
     printf("=====================================================\n\n");
 
     while (1) {
@@ -473,7 +530,7 @@ void accept_clients_loop(int server_fd) {
 
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) {
-            perror("Accept failed");
+            perror("[SERVER ERROR] Accept failed");
             continue;
         }
 
@@ -486,6 +543,7 @@ void accept_clients_loop(int server_fd) {
 
         temp_client_info_t *temp_info = malloc(sizeof(temp_client_info_t));
         if (!temp_info) {
+            fprintf(stderr, "[SERVER ERROR] Memory allocation failed for client connection info\n");
             close(client_fd);
             continue;
         }
@@ -495,7 +553,7 @@ void accept_clients_loop(int server_fd) {
         pthread_t tid;
         int rc = pthread_create(&tid, NULL, client_handler_thread, temp_info);
         if (rc != 0) {
-            fprintf(stderr, "Failed to create thread: %s\n", strerror(rc));
+            fprintf(stderr, "[SERVER ERROR] Failed to create worker thread: %s\n", strerror(rc));
             close(client_fd);
             free(temp_info);
             continue;
@@ -506,6 +564,9 @@ void accept_clients_loop(int server_fd) {
 int main(void) {
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
+
+    // Ignore SIGPIPE so broken socket writes don't kill server process
+    signal(SIGPIPE, SIG_IGN);
 
     int server_fd = create_server_socket();
     if (server_fd < 0) {
