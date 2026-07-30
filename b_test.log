@@ -1,0 +1,15 @@
+Connecting to server at 127.0.0.1:8080...
+Connected to server at 127.0.0.1:8080!
+
+[+] Registered successfully as 'Bob'!
+
+==================================================
+  Structured Protocol Chat & File Transfer Client
+  Logged in as: Bob
+  Commands:
+    /msg <message>              - Send chat message
+    /file <username> <filename> - Transfer file
+    /quit                       - Exit application
+==================================================
+
+Connection closed gracefully.

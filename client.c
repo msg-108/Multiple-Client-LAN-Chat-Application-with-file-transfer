@@ -43,12 +43,26 @@ int send_packet(int sock_fd, int32_t type, const void *payload, int32_t payload_
 }
 
 /**
- * Sends a file from client to target user using FILE_START, FILE_CHUNK, and FILE_END packets.
+ * Sends a file from client to target user using protocol.h structures and read_file_chunk().
+ * 
+ * Workflow:
+ * 1. Open file in binary mode ("rb"); if it fails, print error and abort (do not send FILE_START).
+ * 2. Send FILE_START with FileStartPayload (sender_username, target_username, filename) via send_all.
+ * 3. Loop: read chunk with read_file_chunk(), send as FILE_CHUNK with Header.length set to ACTUAL bytes read.
+ * 4. On EOF, send FILE_END with Header.length = 0 via send_all.
+ * 
+ * @param sock_fd Socket file descriptor.
+ * @param sender_name Username of sender.
+ * @param target_name Username of destination target user.
+ * @param filepath Local path to file.
+ * @return 0 on success, -1 on failure.
  */
 int send_file_to_user(int sock_fd, const char *sender_name, const char *target_name, const char *filepath) {
-    FILE *fp = fopen(filepath, "rb"); // Binary read mode
+    // Step 1: Open file in binary mode ("rb"). If it fails, print error and abort
+    FILE *fp = fopen(filepath, "rb");
     if (!fp) {
-        perror("[-] Failed to open local file for reading");
+        perror("[CLIENT ERROR] Failed to open file for reading");
+        printf("[CLIENT ERROR] Aborting file transfer for '%s' (file not found or permission denied).\n", filepath);
         return -1;
     }
 
@@ -57,48 +71,49 @@ int send_file_to_user(int sock_fd, const char *sender_name, const char *target_n
     if (!basename) basename = strrchr(filepath, '\\');
     basename = (basename) ? (basename + 1) : filepath;
 
-    // 1. Send FILE_START packet with FileStartPayload
+    // Step 2: Send FILE_START with FileStartPayload via send_all
     FileStartPayload meta;
     memset(&meta, 0, sizeof(meta));
     strncpy(meta.sender_username, sender_name, MAX_USERNAME - 1);
     strncpy(meta.target_username, target_name, MAX_USERNAME - 1);
     strncpy(meta.filename, basename, MAX_FILENAME - 1);
 
-    printf("[FILE] Initiating file transfer: '%s' -> '%s' (File: %s)...\n",
+    printf("[CLIENT] Initiating file transfer: '%s' -> '%s' (File: %s)...\n",
            sender_name, target_name, basename);
 
     if (send_packet(sock_fd, FILE_START, &meta, (int32_t)sizeof(FileStartPayload)) < 0) {
-        perror("[-] Failed to send FILE_START packet");
+        perror("[CLIENT ERROR] Failed to send FILE_START packet");
         fclose(fp);
         return -1;
     }
 
-    // 2. Stream FILE_CHUNK packets using read_file_chunk and send_all()
+    // Step 3: Loop reading chunks with read_file_chunk(), sending FILE_CHUNK with Header.length set to ACTUAL bytes read
     char chunk_buffer[CHUNK_SIZE];
     int bytes_read = 0;
     int total_bytes_sent = 0;
 
     while ((bytes_read = read_file_chunk(fp, chunk_buffer, CHUNK_SIZE)) > 0) {
         Header chunk_header = { .type = FILE_CHUNK, .length = bytes_read };
+        // Use send_all for Header and Payload
         if (send_all(sock_fd, &chunk_header, (int)sizeof(Header)) < 0 ||
             send_all(sock_fd, chunk_buffer, bytes_read) < 0) {
-            perror("[-] Error sending FILE_CHUNK packet");
+            perror("[CLIENT ERROR] Error sending FILE_CHUNK packet");
             fclose(fp);
             return -1;
         }
         total_bytes_sent += bytes_read;
     }
 
-    fclose(fp);
+    fclose(fp); // Close file handle on EOF
 
-    // 3. Send FILE_END packet (Header.length == 0)
+    // Step 4: On EOF, send FILE_END with Header.length = 0 via send_all
     Header end_header = { .type = FILE_END, .length = 0 };
     if (send_all(sock_fd, &end_header, (int)sizeof(Header)) < 0) {
-        perror("[-] Failed to send FILE_END packet");
+        perror("[CLIENT ERROR] Failed to send FILE_END packet");
         return -1;
     }
 
-    printf("[FILE] File '%s' (%d bytes) sent successfully to '%s'!\n",
+    printf("[CLIENT] File transfer complete: '%s' (%d bytes) sent successfully to '%s'!\n",
            basename, total_bytes_sent, target_name);
     return 0;
 }
@@ -362,14 +377,12 @@ int main(int argc, char *argv[]) {
 
     char input_buffer[BUFFER_SIZE];
     while (is_running && fgets(input_buffer, sizeof(input_buffer), stdin) != NULL) {
-        // Strip trailing newline / carriage return
         size_t len = strlen(input_buffer);
         while (len > 0 && (input_buffer[len - 1] == '\n' || input_buffer[len - 1] == '\r')) {
             input_buffer[--len] = '\0';
         }
         if (len == 0) continue;
 
-        // Constraint: Parse input before deciding what to send
         if (input_buffer[0] == '/') {
             if (strcmp(input_buffer, "/quit") == 0 || strcmp(input_buffer, "/exit") == 0) {
                 printf("[CLIENT] Sending USER_LEAVE packet and disconnecting...\n");
@@ -405,7 +418,6 @@ int main(int argc, char *argv[]) {
                 }
             }
             else {
-                // Constraint: Report invalid commands rather than crashing or sending garbage to server
                 printf("[CLIENT] Unknown command: '%s'\n", input_buffer);
                 printf("[CLIENT] Available commands:\n");
                 printf("  /msg <message>              - Send chat message\n");
@@ -414,7 +426,6 @@ int main(int argc, char *argv[]) {
             }
         }
         else {
-            // Plain text entry: Send as CHAT packet
             char formatted_msg[BUFFER_SIZE + MAX_USERNAME + 16];
             snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s\n", username, input_buffer);
 
