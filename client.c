@@ -78,7 +78,7 @@ int send_packet(int sock_fd, int32_t type, const void *payload, int32_t payload_
 /**
  * Receiver Worker Thread Routine
  * 
- * Requirement: Display incoming messages as: "[username]: message"
+ * Displays incoming broadcast messages formatted as "[username]: message" or system events.
  */
 void *receive_handler_thread(void *arg) {
     int sock_fd = (int)(intptr_t)arg;
@@ -119,7 +119,7 @@ void *receive_handler_thread(void *arg) {
         // Display incoming message types
         switch (header.type) {
             case CHAT:
-                // Requirement: Display incoming messages as: "[username]: message"
+                // Display incoming chat message: "[username]: message"
                 printf("%s", payload ? payload : "");
                 if (payload && header.length > 0 && payload[header.length - 1] != '\n') {
                     printf("\n");
@@ -179,13 +179,29 @@ int connect_to_server(int sock_fd, const char *ip, int port) {
 }
 
 int main(int argc, char *argv[]) {
+    // Unbuffer stdout and stderr so prompts display instantly
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
 
-    const char *server_ip = (argc > 1) ? argv[1] : DEFAULT_IP;
-    int port = (argc > 2) ? atoi(argv[2]) : DEFAULT_PORT;
-    const char *cli_message = (argc > 3) ? argv[3] : NULL;
-    const char *cli_username = (argc > 4) ? argv[4] : NULL;
+    const char *server_ip = DEFAULT_IP;
+    int port = DEFAULT_PORT;
+    const char *cli_username = NULL;
+
+    // Flexible Command Line Argument Parsing:
+    // Usage 1: ./client (prompts interactively for username)
+    // Usage 2: ./client Alice (connects to 127.0.0.1:8080 as Alice)
+    // Usage 3: ./client 127.0.0.1 8080 (prompts interactively for username)
+    // Usage 4: ./client 127.0.0.1 8080 Alice (connects to 127.0.0.1:8080 as Alice)
+    if (argc == 2) {
+        cli_username = argv[1];
+    } else if (argc == 3) {
+        server_ip = argv[1];
+        port = atoi(argv[2]);
+    } else if (argc >= 4) {
+        server_ip = argv[1];
+        port = atoi(argv[2]);
+        cli_username = argv[3];
+    }
 
     printf("Connecting to server at %s:%d...\n", server_ip, port);
 
@@ -208,17 +224,21 @@ int main(int argc, char *argv[]) {
     int registered = 0;
 
     while (!registered) {
-        if (cli_username != NULL) {
+        if (cli_username != NULL && strlen(cli_username) > 0) {
             strncpy(username, cli_username, MAX_USERNAME - 1);
             username[MAX_USERNAME - 1] = '\0';
         } else {
+            // Display interactive username prompt and flush output buffer
             printf("Enter your username (max %d chars): ", MAX_USERNAME - 1);
+            fflush(stdout);
+
             if (fgets(username, sizeof(username), stdin) == NULL) {
                 printf("\nNo username entered. Exiting.\n");
                 close(sock_fd);
                 exit(EXIT_SUCCESS);
             }
 
+            // Strip trailing newlines / carriage returns
             size_t len = strlen(username);
             while (len > 0 && (username[len - 1] == '\n' || username[len - 1] == '\r')) {
                 username[--len] = '\0';
@@ -230,22 +250,23 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // Send USER_JOIN registration packet
+        // Send USER_JOIN registration packet immediately after connecting
         if (send_packet(sock_fd, USER_JOIN, username, (int32_t)strlen(username)) < 0) {
-            perror("[-] Error sending username packet");
+            perror("[-] Error sending username registration packet");
             close(sock_fd);
             exit(EXIT_FAILURE);
         }
 
-        // Check for immediate server response
+        // Check for immediate server rejection packet (e.g. duplicate username or server full)
         struct timeval tv;
         tv.tv_sec = 0;
-        tv.tv_usec = 200000; // 200ms
+        tv.tv_usec = 200000; // 200ms timeout check
         setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         Header resp_header;
         ssize_t h_res = read_exact(sock_fd, &resp_header, sizeof(Header));
 
+        // Reset socket timeout back to normal
         tv.tv_sec = 0;
         tv.tv_usec = 0;
         setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -260,11 +281,14 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            if (resp_payload && (strstr(resp_payload, "ERROR:") || strstr(resp_payload, "already taken"))) {
-                printf("\n[REJECTED] %s\n", resp_payload);
+            if (resp_payload && (strstr(resp_payload, "ERROR:") || strstr(resp_payload, "already taken") || strstr(resp_payload, "rejected"))) {
+                printf("\n[REJECTED] %s", resp_payload);
+                if (resp_payload[strlen(resp_payload) - 1] != '\n') printf("\n");
                 free(resp_payload);
+
+                // Reset cli_username to force interactive prompt for entering a new name
                 cli_username = NULL;
-                continue;
+                continue; // Retry registration!
             }
 
             if (resp_payload) free(resp_payload);
@@ -275,7 +299,7 @@ int main(int argc, char *argv[]) {
 
     printf("[+] Registered successfully as '%s'!\n\n", username);
 
-    // 4. Spawn Receiver Thread using pthreads
+    // 4. Spawn Receiver Thread using pthreads for non-blocking server message broadcasts
     pthread_t recv_thread;
     if (pthread_create(&recv_thread, NULL, receive_handler_thread, (void *)(intptr_t)sock_fd) != 0) {
         perror("Failed to create receiving thread");
@@ -284,37 +308,28 @@ int main(int argc, char *argv[]) {
     }
 
     // 5. Main Thread Input Loop
-    // Requirement: Format outgoing chat payload so server & clients identify sender and content
-    if (cli_message != NULL) {
+    printf("==================================================\n");
+    printf("  Structured Protocol Chat Client\n");
+    printf("  Logged in as: %s\n", username);
+    printf("  Type messages and press ENTER to send.\n");
+    printf("  Type /quit or /exit to disconnect.\n");
+    printf("==================================================\n\n");
+
+    char input_buffer[BUFFER_SIZE];
+    while (is_running && fgets(input_buffer, sizeof(input_buffer), stdin) != NULL) {
+        if (strncmp(input_buffer, "/quit", 5) == 0 || strncmp(input_buffer, "/exit", 5) == 0) {
+            printf("Sending USER_LEAVE packet and disconnecting...\n");
+            send_packet(sock_fd, USER_LEAVE, username, (int32_t)strlen(username));
+            break;
+        }
+
+        // Format outgoing chat message as "[username]: message"
         char formatted_msg[BUFFER_SIZE + MAX_USERNAME + 16];
-        snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s", username, cli_message);
-        printf("Sending CHAT packet: %s\n", formatted_msg);
-        send_packet(sock_fd, CHAT, formatted_msg, (int32_t)strlen(formatted_msg));
-        usleep(300000);
-    } else {
-        printf("==================================================\n");
-        printf("  Structured Protocol Chat Client\n");
-        printf("  Logged in as: %s\n", username);
-        printf("  Type messages and press ENTER to send.\n");
-        printf("  Type /quit or /exit to disconnect.\n");
-        printf("==================================================\n\n");
+        snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s", username, input_buffer);
 
-        char input_buffer[BUFFER_SIZE];
-        while (is_running && fgets(input_buffer, sizeof(input_buffer), stdin) != NULL) {
-            if (strncmp(input_buffer, "/quit", 5) == 0 || strncmp(input_buffer, "/exit", 5) == 0) {
-                printf("Sending USER_LEAVE packet and disconnecting...\n");
-                send_packet(sock_fd, USER_LEAVE, username, (int32_t)strlen(username));
-                break;
-            }
-
-            // Requirement: Format outgoing chat payload as "[username]: message"
-            char formatted_msg[BUFFER_SIZE + MAX_USERNAME + 16];
-            snprintf(formatted_msg, sizeof(formatted_msg), "[%s]: %s", username, input_buffer);
-
-            if (send_packet(sock_fd, CHAT, formatted_msg, (int32_t)strlen(formatted_msg)) < 0) {
-                perror("[-] Send packet failed");
-                break;
-            }
+        if (send_packet(sock_fd, CHAT, formatted_msg, (int32_t)strlen(formatted_msg)) < 0) {
+            perror("[-] Send packet failed");
+            break;
         }
     }
 
