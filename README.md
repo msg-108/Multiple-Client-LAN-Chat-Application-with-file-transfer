@@ -31,7 +31,9 @@ A multithreaded TCP client-server chat application written in standard C (C11, P
 ├── utils.c         # Implementations of read_file_chunk, write_file_chunk, send_all, and recv_all
 ├── server.c        # Multithreaded TCP chat server & binary file transfer router
 ├── client.c        # Multithreaded TCP chat client with interactive command parser & progress bar
-└── Makefile        # Build instructions for server, client, and test_utils
+├── Makefile        # Build instructions for server, client, and test_utils
+├── README.md       # Project documentation, build/run instructions, and worked examples
+└── TESTING.md      # Comprehensive Test Plan, Test Matrix, and Verification Logs
 ```
 
 ---
@@ -63,8 +65,11 @@ gcc -Wall -Wextra -std=c11 -pthread -c utils.c
 # 2. Compile and link the Server
 gcc -Wall -Wextra -std=c11 -pthread -o server server.c utils.o
 
-# 3. Compile and link the Client
+# 3. Compile and link the Server & Client
 gcc -Wall -Wextra -std=c11 -pthread -o client client.c utils.o
+
+# 4. Compile the Unit Test binary
+gcc -Wall -Wextra -std=c11 -pthread -DTEST_UTILS -o test_utils utils.c
 ```
 
 ---
@@ -162,6 +167,35 @@ Inside the client interface, you can use the following commands:
    [RECV PROGRESS] Receiving 'sample.pdf': 100% (1048576/1048576 bytes)
    File transfer complete for 'sample.pdf' from 'Alice' (1048576 bytes)!
    ```
+
+---
+
+## Testing & Verification
+
+For detailed test procedures, test logs, and failure handling verification, consult [TESTING.md](file:///wsl.localhost/Ubuntu/home/loq/Multiple-Client-LAN-Chat-Application-with-file-transfer/TESTING.md).
+
+### Quick Unit Test Verification
+
+To execute the unit test suite for binary file chunking:
+
+```bash
+./test_utils
+```
+
+### Verified Test Suite Summary (`TESTING.md`)
+
+| Test ID | Test Category | Description | Status |
+| :---: | :--- | :--- | :---: |
+| **TC-01** | Basic Chat | `/msg` chat message delivery | **PASS** |
+| **TC-02** | Multi-Client Broadcast | Broadcast to multiple clients without blocking | **PASS** |
+| **TC-03** | Username Rejection | Duplicate username rejection under mutex lock | **PASS** |
+| **TC-04** | Small File Transfer | Text/binary transfer (< 1 KB) | **PASS** |
+| **TC-05** | Large File Transfer | 8 MB binary file transfer with progress indicator | **PASS** |
+| **TC-06** | Empty File Transfer | Boundary case (0-byte file) | **PASS** |
+| **TC-07** | Disconnect Mid-Transfer | Mid-stream disconnect cleanup & partial file removal | **PASS** |
+| **TC-08** | Target User Offline | File transfer attempt to offline target user | **PASS** |
+| **TC-09** | Missing Local File | File transfer attempt for missing file path | **PASS** |
+| **TC-10** | Invalid Commands | Command syntax parsing & malformed header protection | **PASS** |
 
 ---
 
