@@ -36,14 +36,14 @@ A multithreaded TCP client-server chat application written in standard C (C11, P
 ├── client.c        # Multithreaded TCP chat client with interactive command parser & progress bar
 ├── Makefile        # Build instructions for server, client, and test_utils
 ├── README.md       # Project documentation, build/run instructions, and worked examples
-└── TESTING.md      # Comprehensive Test Plan, Test Matrix, Phase 8 Report, and Demo Sequence
+└── TESTING.md      # Comprehensive Test Plan, Test Matrix, and Demo Sequence
 ```
 
 ---
 
 ## Build Instructions
 
-### Option 1: Using `gcc` Directly (Phase 8 Specification)
+### Option 1: Using `gcc` Directly
 
 ```bash
 # 1. Compile and link the Server
