@@ -1,6 +1,18 @@
 # Multiple-Client LAN Chat Application with File Transfer
 
-A multithreaded TCP client-server chat application written in standard C (C11, POSIX sockets, `pthreads`) featuring structured protocol headers, atomic duplicate username enforcement, non-blocking broadcasting, direct file transfer routing, text-based progress indicators, and fault isolation.
+A multithreaded TCP client-server chat application written in standard C (C11, POSIX / Winsock sockets, `pthreads`) featuring structured protocol headers, atomic duplicate username enforcement, non-blocking broadcasting, direct file transfer routing, text-based progress indicators, and cross-platform support for **macOS**, **Windows**, and **Linux**.
+
+> 📖 **Quick Run Guide**: For complete, step-by-step setup and execution instructions tailored for **macOS**, **Windows** (WSL / MinGW), and **Linux**, see [HOW_TO_RUN.md](file:///wsl.localhost/Ubuntu/home/loq/Multiple-Client-LAN-Chat-Application-with-file-transfer/HOW_TO_RUN.md).
+
+---
+
+## 💻 Platform Compatibility
+
+| Operating System | Compiler / Tools | Socket Subsystem | Build Command |
+| :--- | :--- | :--- | :--- |
+| **macOS (Darwin)** | Clang / GCC (`xcode-select --install`) | BSD Sockets (`SO_NOSIGPIPE`) | `make` |
+| **Windows 10/11** | MinGW-w64 / MSYS2 / WSL | Winsock2 (`ws2_32.lib`) / POSIX | `make` / `gcc ... -lws2_32` |
+| **Linux** | GCC / Clang (`build-essential`) | POSIX Sockets (`MSG_NOSIGNAL`) | `make` |
 
 ---
 

@@ -2,7 +2,43 @@
 #define UTILS_H
 
 #include <stdio.h>
-#include <sys/socket.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef _WIN32
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #pragma comment(lib, "ws2_32.lib")
+    typedef int socklen_t;
+    #define close_socket(s) closesocket(s)
+#else
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <unistd.h>
+    #include <signal.h>
+    #define close_socket(s) close(s)
+#endif
+
+// MSG_NOSIGNAL is a Linux socket flag not defined on macOS (Darwin) or Windows
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
+/**
+ * Initializes socket subsystem (WSAStartup on Windows, no-op on POSIX).
+ */
+int init_sockets(void);
+
+/**
+ * Cleans up socket subsystem (WSACleanup on Windows, no-op on POSIX).
+ */
+void cleanup_sockets(void);
+
+/**
+ * Sets socket options for signal safety (SO_NOSIGPIPE on macOS/Darwin).
+ */
+void set_socket_nosigpipe(int sock);
 
 /**
  * Reads up to chunk_size bytes from an open binary file stream using fread().
@@ -46,3 +82,4 @@ int send_all(int sock, void *buf, int len);
 int recv_all(int sock, void *buf, int len);
 
 #endif // UTILS_H
+

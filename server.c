@@ -1,14 +1,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <signal.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
 #include <pthread.h>
 #include "protocol.h"
 #include "utils.h"
+
 
 #define PORT        8080
 #define BACKLOG     10
@@ -248,10 +244,12 @@ int create_server_socket(void) {
         return -1;
     }
 
+    set_socket_nosigpipe(server_fd);
+
     int opt = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt)) < 0) {
         perror("[SERVER ERROR] setsockopt SO_REUSEADDR failed");
-        close(server_fd);
+        close_socket(server_fd);
         return -1;
     }
 
@@ -534,6 +532,8 @@ void accept_clients_loop(int server_fd) {
             continue;
         }
 
+        set_socket_nosigpipe(client_fd);
+
         char client_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, sizeof(client_ip));
         int client_port = ntohs(client_addr.sin_port);
@@ -565,23 +565,32 @@ int main(void) {
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
 
+    if (init_sockets() < 0) {
+        exit(EXIT_FAILURE);
+    }
+
+#ifndef _WIN32
     // Ignore SIGPIPE so broken socket writes don't kill server process
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     int server_fd = create_server_socket();
     if (server_fd < 0) {
+        cleanup_sockets();
         exit(EXIT_FAILURE);
     }
     printf("[Step 1] Socket created successfully (FD: %d)\n", server_fd);
 
     if (bind_server_socket(server_fd, PORT) < 0) {
-        close(server_fd);
+        close_socket(server_fd);
+        cleanup_sockets();
         exit(EXIT_FAILURE);
     }
     printf("[Step 2] Bound successfully to port %d\n", PORT);
 
     if (start_listening(server_fd, BACKLOG) < 0) {
-        close(server_fd);
+        close_socket(server_fd);
+        cleanup_sockets();
         exit(EXIT_FAILURE);
     }
     printf("[Step 3] Server listening with backlog queue of %d\n\n", BACKLOG);
@@ -589,6 +598,7 @@ int main(void) {
     accept_clients_loop(server_fd);
 
     pthread_mutex_destroy(&clients_mutex);
-    close(server_fd);
+    close_socket(server_fd);
+    cleanup_sockets();
     return 0;
 }

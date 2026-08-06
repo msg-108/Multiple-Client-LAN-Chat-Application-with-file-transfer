@@ -2,9 +2,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <inttypes.h>
@@ -303,6 +300,7 @@ int create_client_socket(void) {
         perror("[CLIENT ERROR] Socket creation error");
         return -1;
     }
+    set_socket_nosigpipe(sock_fd);
     return sock_fd;
 }
 
@@ -330,7 +328,7 @@ int establish_connection(const char *server_ip, int port) {
     int sock_fd = create_client_socket();
     if (sock_fd < 0) return -1;
     if (connect_to_server(sock_fd, server_ip, port) < 0) {
-        close(sock_fd);
+        close_socket(sock_fd);
         return -1;
     }
     return sock_fd;
@@ -339,6 +337,14 @@ int establish_connection(const char *server_ip, int port) {
 int main(int argc, char *argv[]) {
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
+
+    if (init_sockets() < 0) {
+        exit(EXIT_FAILURE);
+    }
+
+#ifndef _WIN32
+    signal(SIGPIPE, SIG_IGN);
+#endif
 
     const char *server_ip = DEFAULT_IP;
     int port = DEFAULT_PORT;
@@ -398,17 +404,28 @@ int main(int argc, char *argv[]) {
             exit(EXIT_FAILURE);
         }
 
+#ifdef _WIN32
+        DWORD tv = 200;
+        setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+#else
         struct timeval tv;
         tv.tv_sec = 0;
         tv.tv_usec = 200000;
-        setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+#endif
 
         Header resp_header;
         int h_res = recv_all(sock_fd, &resp_header, (int)sizeof(Header));
 
-        tv.tv_sec = 0;
-        tv.tv_usec = 0;
-        setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#ifdef _WIN32
+        DWORD tv_zero = 0;
+        setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv_zero, sizeof(tv_zero));
+#else
+        struct timeval tv_zero;
+        tv_zero.tv_sec = 0;
+        tv_zero.tv_usec = 0;
+        setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv_zero, sizeof(tv_zero));
+#endif
 
         if (h_res == (int)sizeof(Header)) {
             char *resp_payload = NULL;
@@ -528,8 +545,9 @@ int main(int argc, char *argv[]) {
     }
 
     is_running = 0;
-    close(sock_fd);
+    close_socket(sock_fd);
     pthread_join(recv_thread, NULL);
+    cleanup_sockets();
 
     printf("[CLIENT] Connection closed gracefully. Goodbye!\n");
     return 0;

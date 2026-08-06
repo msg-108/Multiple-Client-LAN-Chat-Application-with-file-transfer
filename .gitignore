@@ -1,0 +1,13 @@
+# Compiled binaries & object files
+server
+client
+test_utils
+*.exe
+*.o
+*.dSYM/
+*.bin
+
+# Test binaries & logs
+srv.log
+test_input.bin
+test_output.bin

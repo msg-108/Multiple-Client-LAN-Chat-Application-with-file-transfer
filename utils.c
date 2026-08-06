@@ -2,7 +2,33 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
+
+int init_sockets(void) {
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        fprintf(stderr, "[ERROR] WSAStartup failed.\n");
+        return -1;
+    }
+#endif
+    return 0;
+}
+
+void cleanup_sockets(void) {
+#ifdef _WIN32
+    WSACleanup();
+#endif
+}
+
+void set_socket_nosigpipe(int sock) {
+#ifdef SO_NOSIGPIPE
+    int opt = 1;
+    setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+#else
+    (void)sock;
+#endif
+}
+
 
 /**
  * Requirement: send_all
